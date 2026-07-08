@@ -1,0 +1,21 @@
+[project]
+name = "docgen"
+version = "0.0.1"
+description = "Инструмент с встроенным ИИ-агентом, предназначенный для автоматического поддержания документации программного продукта на основе анализа git-репозитория."
+authors = [{name = "daisccho"}]
+readme = "README.md"
+requires-python = ">=3.11"
+
+dependencies = [
+    "click>=8.1",
+    "gitpython>=3.1",
+    "openai>=1.0",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+docgen = "docgen.main:cli"
+
+[tool.setuptools.packages.find]
+include = ["docgen*"]
