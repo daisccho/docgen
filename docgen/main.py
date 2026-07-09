@@ -10,12 +10,24 @@ from typing import Optional
 import click
 
 from docgen.agent import DocAgent
-from docgen.config import find_project_root, init_project, load_state, save_state
+from docgen.config import (
+    find_project_root,
+    init_project,
+    load_release_map,
+    load_state,
+    save_release_map,
+    save_state,
+)
 from docgen.errors import DocAgentError
 from docgen.git_analyzer import (
+    fetch_tags,
+    get_all_tags_with_hash,
+    get_latest_tag,
     get_snapshot_versions,
+    get_tag_commit_hash,
+    sanitize_tag_name,
 )
-from docgen.models import ProjectState
+from docgen.models import ProjectState, ReleaseMap
 
 
 def _require_state() -> ProjectState:
@@ -65,20 +77,20 @@ def cli(ctx: click.Context, verbose: bool) -> None:
 
 @cli.command()
 @click.option("--repo", required=True, help="URL git-репозитория (https://...)")
-@click.option("--token-env", default=None,
-              help="Имя переменной окружения с токеном доступа к git")
+@click.option("--github-token-env", default=None,
+              help="Имя переменной окружения с GitHub-токеном")
 @click.option("--api-key", default=None, help="API-ключ LLM (или OPENAI_API_KEY в env)")
 @click.option("--base-url", default=None, help="Base URL для OpenAI-совместимого API")
 @click.option("--model", default="gpt-4o", help="Модель LLM")
 @click.option("--project", default="default", help="Имя проекта")
 @click.option("--iterations", "-i", default=None, type=int,
               help="Максимум ходов (по умолч. 10)")
-def init(repo: str, token_env: Optional[str], api_key: Optional[str],
+def init(repo: str, github_token_env: Optional[str], api_key: Optional[str],
          base_url: Optional[str], model: str, project: str,
          iterations: Optional[int]) -> None:
     """Инициализировать проект docgen в текущей папке.
 
-    Создаёт .docgen.yaml, клонирует репозиторий в .clone/.
+    Создаёт .docgen.yaml, .release-map.yaml и клонирует репозиторий в .clone/.
     """
     _echo_title()
 
@@ -93,10 +105,13 @@ def init(repo: str, token_env: Optional[str], api_key: Optional[str],
         llm_api_key=api_key,
         llm_model=model,
         llm_base_url=base_url,
-        access_token_env=token_env,
+        github_token_env=github_token_env,
         project_name=project,
         max_turns=iterations,
     )
+
+    # Создаём пустой release map
+    save_release_map(ReleaseMap())
 
     # Клонируем репозиторий
     _echo_info("Клонирование репозитория...")
@@ -108,11 +123,13 @@ def init(repo: str, token_env: Optional[str], api_key: Optional[str],
 
     saved = find_project_root()
     _echo_ok(f"Проект инициализирован: {saved / '.docgen.yaml'}")
+    _echo_ok(f"Release map создан: {saved / '.release-map.yaml'}")
     click.echo()
     click.echo("Что дальше:")
-    click.echo("  docgen snapshot           — создать первый снэпшот документации")
+    click.echo("  docgen snapshot           — создать первый снэпшот по последнему релизу")
+    click.echo("  docgen snapshot -r v1.0   — снэпшот по конкретному тегу")
     click.echo("  docgen snapshot -c        — снэпшот + проверка актуальности")
-    click.echo("  docgen watch -b main -t 5 — запустить автообновление каждые 5 мин")
+    click.echo("  docgen watch -t 5         — следить за новыми релизами каждые 5 мин")
     click.echo("  docgen versions           — список версий")
 
 
@@ -120,8 +137,8 @@ def init(repo: str, token_env: Optional[str], api_key: Optional[str],
 
 
 @cli.command()
-@click.option("--ref", "-r", default=None,
-              help="Тег, хэш или ветка (v1.0, abc1234). По умолчанию HEAD")
+@click.option("--release", "-r", default=None,
+              help="Тег релиза (v1.0, release-2024-01). По умолчанию — последний релиз")
 @click.option("--check", "-c", is_flag=True,
               help="Проверить каждый .md на соответствие коду (полный аудит)")
 @click.option("--iterations", "-i", default=None, type=int,
@@ -129,14 +146,15 @@ def init(repo: str, token_env: Optional[str], api_key: Optional[str],
 @click.option("--log", "-l", is_flag=True, help="Логировать в logs/")
 @click.option("--verbose", "-v", is_flag=True, help="Подробный вывод")
 @click.pass_context
-def snapshot(ctx: click.Context, ref: Optional[str],
+def snapshot(ctx: click.Context, release: Optional[str],
              check: bool, iterations: Optional[int],
              log: bool, verbose: bool) -> None:
-    """Создать снэпшот документации.
+    """Создать снэпшот документации по тегу релиза.
 
-    Копирует все .md-файлы из репозитория в папку <commit_hash>/.
-    По умолчанию — на HEAD. Через --ref можно указать тег, хэш или ветку.
-    Флаг -c запускает LLM-аудит, -l включает лог в logs/.
+    Без -r — по последнему релизу (HEAD релизной ветки).
+    С -r — по указанному тегу (например v1.0, release-2024-01).
+    Копирует .md-файлы в папку <sanitized_tag_name>/.
+    -c запускает LLM-аудит, -l включает лог в logs/.
     """
     _echo_title()
     state = _require_state()
@@ -145,7 +163,7 @@ def snapshot(ctx: click.Context, ref: Optional[str],
     agent = DocAgent(state, verbose=verbose, log=log)
 
     try:
-        result = agent.snapshot(ref=ref, check=check, max_turns=iterations)
+        result = agent.snapshot(release_tag=release, check=check, max_turns=iterations)
     except DocAgentError as exc:
         click.secho(f"❌ {exc}", fg="red", err=True)
         sys.exit(1)
@@ -167,21 +185,21 @@ def snapshot(ctx: click.Context, ref: Optional[str],
 
 
 @cli.command()
-@click.option("--branch", "-b", default="main", help="Ветка для отслеживания")
 @click.option("--interval", "-t", default=10, type=int,
-              help="Интервал проверки в минутах")
+              help="Интервал проверки новых релизов в минутах")
 @click.option("--iterations", "-i", default=None, type=int,
               help="Максимум ходов (вызовов terminal) на один .md")
 @click.option("--log", "-l", is_flag=True, help="Логировать в logs/")
 @click.option("--verbose", "-v", is_flag=True, help="Подробный вывод")
 @click.pass_context
-def watch(ctx: click.Context, branch: str, interval: int,
+def watch(ctx: click.Context, interval: int,
           iterations: Optional[int], log: bool,
           verbose: bool) -> None:
-    """Запустить демон автообновления документации.
+    """Запустить демон автообновления документации по релизам.
 
-    Каждые N минут проверяет ветку BRANCH, при новых коммитах
-    генерирует обновлённую документацию в новой папке <commit_hash>/.
+    Каждые N минут проверяет наличие новых тегов в репозитории,
+    и при появлении нового релиза генерирует обновлённую документацию
+    в новой папке <sanitized_tag_name>/.
     -l включает лог в logs/.
     """
     _echo_title()
@@ -189,7 +207,6 @@ def watch(ctx: click.Context, branch: str, interval: int,
 
     verbose = verbose or ctx.obj.get("verbose", False)
 
-    click.echo(f"  Ветка: {branch}")
     click.echo(f"  Интервал: {interval} мин")
     click.echo(f"  Рабочая папка: {find_project_root()}")
     click.echo()
@@ -198,7 +215,7 @@ def watch(ctx: click.Context, branch: str, interval: int,
         agent = DocAgent(state, verbose=verbose, log=log)
         if iterations is not None:
             agent._max_turns = iterations
-        agent.watch(branch=branch, interval=interval)
+        agent.watch(interval=interval)
     except KeyboardInterrupt:
         click.echo("\n  ✋ Остановлено пользователем.")
         sys.exit(0)
@@ -214,7 +231,7 @@ def watch(ctx: click.Context, branch: str, interval: int,
 def versions() -> None:
     """Список созданных версий документации (папок-снэпшотов)."""
     _echo_title()
-    state = _require_state()
+    _require_state()
 
     root = find_project_root()
     if not root:
@@ -227,9 +244,10 @@ def versions() -> None:
         _echo_info("Создайте первую: docgen snapshot")
         return
 
+    release_map = load_release_map()
+    current = release_map.last_documented_release
     click.echo(f"Версии ({len(snaps)}):")
     for s in snaps:
-        current = state.last_documented_commit and state.last_documented_commit.startswith(s["hash"])
-        marker = " ★" if current else ""
-        click.echo(f"  {s['hash8']}{marker}")
+        marker = " ★" if s["name"] == current else ""
+        click.echo(f"  {s['name']}{marker}")
     click.echo()

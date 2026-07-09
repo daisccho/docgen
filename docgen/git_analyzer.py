@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import git
+import requests
 from git import Repo
 
 from docgen.errors import DocAgentError, NotGitRepositoryError, RefNotFoundError
@@ -129,19 +131,78 @@ def clone_repo(repo_url: str, clone_path: str, token: Optional[str] = None) -> R
     return repo
 
 
-def ensure_clone(repo_url: str, clone_path: str, token: Optional[str] = None) -> Repo:
+def ensure_clone(
+    repo_url: str,
+    clone_path: str,
+    token: Optional[str] = None,
+    verbose: bool = False,
+) -> Repo:
     """Открыть существующий bare-клон или создать новый.
 
-    В отличие от clone_repo() — НЕ делает fetch, если клон уже есть.
-    Используется для snapshot с фиксированным ref: если ref уже есть
-    локально, сетевой запрос не нужен.
+    Проверяет, что существующий .clone/ принадлежит тому же репозиторию.
+    Если URL не совпадает — удаляет старый и клонирует заново.
+    Если verbose=True — git clone пишет прогресс в терминал (как сам git).
     """
-    url = get_authenticated_url(repo_url, token)
+    # Если клон уже существует — проверяем remote URL
     if os.path.isdir(clone_path):
-        return _get_repo(clone_path)
-    repo = Repo.clone_from(url, clone_path, bare=True)
+        try:
+            repo = _get_repo(clone_path)
+            actual_url = repo.remotes.origin.url
+
+            # Сравниваем owner/repo из URL (без учёта протокола, токена, .git)
+            def normalize_url(url: str) -> str:
+                # Убираем протокол, токен, .git
+                url = re.sub(r'^https?://[^@]+@', '', url)
+                url = re.sub(r'\.git$', '', url)
+                url = re.sub(r'^git@', '', url)
+                url = re.sub(r'^ssh://', '', url)
+                return url.rstrip('/')
+
+            if normalize_url(actual_url) == normalize_url(repo_url):
+                return repo
+            # URL не совпадает — удаляем и клонируем заново
+            import shutil
+            shutil.rmtree(clone_path)
+        except Exception:
+            import shutil
+            shutil.rmtree(clone_path)
+
+    # Клонируем с прогрессом (stderr в терминал, как сам git)
+    url = get_authenticated_url(repo_url, token)
+    _clone_with_progress(url, clone_path, verbose)
+    repo = _get_repo(clone_path)
     _ensure_fetch_refspec(repo)
     return repo
+
+
+def _clone_with_progress(
+    url: str,
+    clone_path: str,
+    verbose: bool = False,
+) -> None:
+    """Клонировать bare-репозиторий.
+
+    При verbose=True git пишет прогресс напрямую в терминал (stderr
+    наследуется от родителя) — та же однострочная анимация, что и в git.
+    При verbose=False — тихо.
+    """
+    cmd = ["git", "clone", "--bare"]
+    if verbose:
+        cmd.append("--progress")
+    cmd.extend([url, clone_path])
+
+    if verbose:
+        # stderr наследуется от терминала — git сам обновляет одну строку
+        proc = subprocess.Popen(cmd)
+        proc.wait()
+    else:
+        proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        proc.wait()
+
+    if proc.returncode != 0:
+        raise DocAgentError(
+            f"git clone завершился с ошибкой (код {proc.returncode})"
+        )
 
 
 def ref_exists_locally(clone_path: str, ref: str) -> bool:
@@ -175,6 +236,85 @@ def fetch_repo(clone_path: str, token: Optional[str] = None) -> None:
     repo = _get_repo(clone_path)
     _ensure_fetch_refspec(repo)
     repo.remotes.origin.fetch()
+
+
+# ── Работа с тегами релизов ───────────────────────────────
+
+
+def fetch_tags(clone_path: str, token: Optional[str] = None) -> None:
+    """Сделать fetch --tags в существующий bare-клон."""
+    repo = _get_repo(clone_path)
+    _ensure_fetch_refspec(repo)
+    repo.remotes.origin.fetch(tags=True)
+
+
+def get_latest_tag(
+    clone_path: str,
+    github_token: Optional[str] = None,
+    repo_url: Optional[str] = None,
+) -> Optional[str]:
+    """Получить последний релизный тег.
+
+    Если есть github_token и repo_url — использует GitHub API /releases/latest.
+    Иначе — git tag --sort=-version:refname | head -1.
+    Возвращает None если тегов нет.
+    """
+    if github_token and repo_url:
+        # Парсим owner/repo из URL
+        m = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$", repo_url)
+        if m:
+            owner = m.group(1)
+            repo_name = m.group(2).rstrip("/")
+            api_url = f"https://api.github.com/repos/{owner}/{repo_name}/releases/latest"
+            headers = {
+                "Authorization": f"Bearer {github_token}",
+                "Accept": "application/vnd.github.v3+json",
+            }
+            try:
+                resp = requests.get(api_url, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    return resp.json()["tag_name"]
+            except Exception:
+                pass
+
+    # Fallback: git tag
+    try:
+        result = subprocess.run(
+            ["git", "tag", "--sort=-version:refname"],
+            capture_output=True, text=True, cwd=clone_path,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().splitlines()[0]
+    except Exception:
+        pass
+    return None
+
+
+def get_tag_commit_hash(clone_path: str, tag_name: str) -> Optional[str]:
+    """Получить хэш коммита, на который указывает тег."""
+    repo = _get_repo(clone_path)
+    try:
+        tag = repo.tags[tag_name]
+        return tag.commit.hexsha
+    except (IndexError, TypeError):
+        return None
+
+
+def get_all_tags_with_hash(clone_path: str) -> dict[str, str]:
+    """Получить все теги и их хэши: {тег: хэш}."""
+    repo = _get_repo(clone_path)
+    result: dict[str, str] = {}
+    for tag in repo.tags:
+        try:
+            result[tag.name] = tag.commit.hexsha
+        except Exception:
+            pass
+    return result
+
+
+def sanitize_tag_name(tag: str) -> str:
+    """Заменить / в имени тега на - для файловой системы."""
+    return tag.replace("/", "-")
 
 
 # ── Чтение информации из репозитория ───────────────────────
@@ -312,17 +452,15 @@ def get_deleted_md_files(clone_path: str, from_ref: str, to_ref: str) -> list[st
 
 
 def get_snapshot_versions(work_dir: str) -> list[dict]:
-    """Получить список версий документации в рабочей папке.
+    """Получить список версий документации (папок-снэпшотов).
 
     Returns:
-        Список словарей: {hash, dir} отсортированных от новых к старым.
+        Список словарей: {name, dir}, отсортированных по имени (reverse).
     """
     root = Path(work_dir)
     versions: list[dict] = []
     for entry in root.iterdir():
         if entry.is_dir() and not entry.name.startswith("."):
-            # Папка названа хэшем коммита — 7+ hex-символов
-            if re.fullmatch(r"[0-9a-f]{7,40}", entry.name):
-                versions.append({"hash": entry.name, "hash8": entry.name[:8], "dir": str(entry)})
-    versions.sort(key=lambda v: v["hash"], reverse=True)
+            versions.append({"name": entry.name, "dir": str(entry)})
+    versions.sort(key=lambda v: v["name"], reverse=True)
     return versions

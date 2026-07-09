@@ -52,14 +52,17 @@ class GenerationResult(BaseModel):
     docs_removed: int = Field(0, description="Сколько .md удалено")
     tokens_used: int = Field(0, description="Затрачено токенов")
     warnings: list[str] = Field(default_factory=list, description="Предупреждения")
+    updated_files: list[str] = Field(default_factory=list, description="Пути .md, обновлённых через LLM")
+    added_files: list[str] = Field(default_factory=list, description="Пути новых .md из репозитория")
+    removed_files: list[str] = Field(default_factory=list, description="Пути .md, удалённых из снэпшота")
 
 
 class ProjectConfig(BaseModel):
     """Конфигурация проекта docgen."""
     git_repo: str = Field(description="URL git-репозитория")
-    access_token_env: Optional[str] = Field(
+    github_token_env: Optional[str] = Field(
         None,
-        description="Имя переменной окружения с токеном доступа (не сам токен)",
+        description="Имя переменной окружения с GitHub-токеном (не сам токен)",
     )
     llm_provider: str = Field("openai", description="Провайдер LLM")
     llm_model: str = Field("gpt-4o", description="Модель LLM")
@@ -72,18 +75,21 @@ class ProjectConfig(BaseModel):
         10,
         description="Максимум ходов агента (вызовов terminal) на один .md",
         ge=5,
-        le=200,
+        le=500,
+    )
+
+
+class ReleaseMap(BaseModel):
+    """Маппинг тегов релизов на хэши коммитов."""
+    last_documented_release: Optional[str] = Field(
+        None, description="Имя последнего задокументированного тега",
+    )
+    releases: dict[str, str] = Field(
+        default_factory=dict,
+        description="Карта: тег → хэш коммита",
     )
 
 
 class ProjectState(BaseModel):
     """Состояние проекта — сериализуется в .docgen.yaml."""
     config: ProjectConfig = Field(description="Конфигурация")
-    last_documented_commit: Optional[str] = Field(
-        None,
-        description="SHA последнего задокументированного коммита",
-    )
-    initial_commit: Optional[str] = Field(
-        None,
-        description="SHA первого снэпшота. Используется как база отсчёта изменений в watch.",
-    )

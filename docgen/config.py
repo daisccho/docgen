@@ -8,9 +8,10 @@ from typing import Optional
 
 import yaml
 
-from docgen.models import ProjectConfig, ProjectState
+from docgen.models import ProjectConfig, ProjectState, ReleaseMap
 
 CONFIG_FILENAME = ".docgen.yaml"
+RELEASE_MAP_FILENAME = ".release-map.yaml"
 
 
 def _default_state(git_repo: str) -> ProjectState:
@@ -76,18 +77,50 @@ def save_state(state: ProjectState, path: Optional[str] = None) -> Path:
     return cfg_path
 
 
+def load_release_map(path: Optional[str] = None) -> ReleaseMap:
+    """Загрузить .release-map.yaml из корня проекта.
+
+    Если файла нет — вернуть пустой ReleaseMap().
+    """
+    root = find_project_root(path)
+    if root is None:
+        return ReleaseMap()
+    map_path = root / RELEASE_MAP_FILENAME
+    if not map_path.exists():
+        return ReleaseMap()
+    with open(map_path) as f:
+        data = yaml.safe_load(f) or {}
+    return ReleaseMap.model_validate(data)
+
+
+def save_release_map(release_map: ReleaseMap, path: Optional[str] = None) -> Path:
+    """Сохранить .release-map.yaml в корень проекта."""
+    root = find_project_root(path) or Path(os.getcwd()).resolve()
+    map_path = root / RELEASE_MAP_FILENAME
+    with open(map_path, "w") as f:
+        yaml.dump(
+            release_map.model_dump(mode="json"),
+            f,
+            default_flow_style=False,
+            sort_keys=False,
+            allow_unicode=True,
+        )
+    return map_path
+
+
 def init_project(
     git_repo: str,
     llm_api_key: Optional[str] = None,
     llm_model: Optional[str] = None,
     llm_base_url: Optional[str] = None,
-    access_token_env: Optional[str] = None,
+    github_token_env: Optional[str] = None,
     project_name: Optional[str] = None,
     max_turns: Optional[int] = None,
 ) -> ProjectState:
     """Инициализировать новый проект docgen.
 
     .docgen.yaml создаётся в текущей рабочей папке.
+    Также создаётся пустой .release-map.yaml.
     """
     state = _default_state(git_repo)
     if llm_api_key:
@@ -96,11 +129,12 @@ def init_project(
         state.config.llm_model = llm_model
     if llm_base_url:
         state.config.llm_base_url = llm_base_url
-    if access_token_env:
-        state.config.access_token_env = access_token_env
+    if github_token_env:
+        state.config.github_token_env = github_token_env
     if project_name:
         state.config.project_name = project_name
     if max_turns is not None:
         state.config.max_turns = max_turns
     save_state(state)
+    save_release_map(ReleaseMap())
     return state

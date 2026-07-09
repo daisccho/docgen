@@ -152,6 +152,13 @@ activemq-data/
 # Environments
 .env
 .envrc
+# Docgen generated files
+.docgen.yaml
+.release-map.yaml
+CHANGELOG.md
+.clone/
+
+# Environments
 .venv
 env/
 venv/

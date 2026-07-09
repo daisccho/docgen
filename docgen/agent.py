@@ -11,7 +11,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from docgen.config import find_project_root, save_state
+from docgen.config import (
+    find_project_root,
+    load_release_map,
+    save_release_map,
+    save_state,
+)
 from docgen.doc_generator import DocGenerator
 from docgen.git_analyzer import (
     clone_repo,
@@ -22,6 +27,7 @@ from docgen.git_analyzer import (
     get_deleted_md_files,
     get_diff_files,
     get_head_hash,
+    get_latest_tag,
     get_new_md_files,
     get_raw_diffs,
     get_snapshot_versions,
@@ -147,8 +153,8 @@ class DocAgent:
 
         # Токен доступа к git (из переменной окружения)
         self._token: Optional[str] = None
-        if cfg.access_token_env:
-            self._token = os.environ.get(cfg.access_token_env)
+        if cfg.github_token_env:
+            self._token = os.environ.get(cfg.github_token_env)
 
         # Максимум ходов инструментального цикла
         self._max_turns = cfg.max_turns
@@ -161,19 +167,20 @@ class DocAgent:
 
     def snapshot(
         self,
-        ref: Optional[str] = None,
+        release_tag: Optional[str] = None,
         check: bool = False,
         max_turns: Optional[int] = None,
     ) -> GenerationResult:
         """Создать снэпшот документации.
 
-        Без ref — на текущем HEAD. С ref — на указанном теге, хэше
+        Без release_tag — на текущем HEAD. С release_tag — на указанном теге, хэше
         или ветке (например v1.0, abc1234, main).
 
         Копирует все .md-файлы из репозитория в <work_dir>/<hash>/.
         Если check=True, дополнительно запускает аудит.
         """
         self._log_open("snapshot")
+        ref = release_tag
 
         # ── Клон: создать или открыть ──
         if self.verbose:
@@ -182,28 +189,53 @@ class DocAgent:
 
         if ref:
             # Фиксированный ref: не фетчим, если уже есть локально
-            ensure_clone(self.state.config.git_repo, self._clone_dir, self._token)
+            ensure_clone(
+                self.state.config.git_repo, self._clone_dir, self._token,
+                verbose=self.verbose,
+            )
             if self.verbose:
                 self._log(f"  [agent]   ✅ Клон готов ({time.monotonic() - t0:.1f}с)")
             if self.verbose:
-                self._log(f"  [agent]   🔍 Поиск {ref} в локальном клоне...")
+                self._log(f"  [agent]   🔍 Поиск тега {ref}...")
                 t0 = time.monotonic()
             commit_hash = ensure_ref_available(self._clone_dir, ref)
             if self.verbose:
-                self._log(f"  [agent]   ✅ Ref найден ({time.monotonic() - t0:.1f}с)")
+                self._log(f"  [agent]   ✅ Тег найден ({time.monotonic() - t0:.1f}с)")
         else:
-            # Без ref — фетчим, чтобы получить актуальный HEAD
-            clone_repo(self.state.config.git_repo, self._clone_dir, self._token)
-            if self.verbose:
-                self._log(f"  [agent]   ✅ Клон готов ({time.monotonic() - t0:.1f}с)")
-            commit_hash = get_head_hash(self._clone_dir)
+            # Без ref — ищем последний релиз через GitHub API, иначе HEAD
+            ensure_clone(
+                self.state.config.git_repo, self._clone_dir, self._token,
+                verbose=self.verbose,
+            )
+            latest = get_latest_tag(
+                self._clone_dir,
+                github_token=self._token,
+                repo_url=self.state.config.git_repo,
+            )
+            if latest:
+                ref = latest
+                if self.verbose:
+                    self._log(f"  [agent]   🔍 Последний релиз: {ref}")
+                    t0 = time.monotonic()
+                commit_hash = ensure_ref_available(self._clone_dir, ref)
+                if self.verbose:
+                    self._log(f"  [agent]   ✅ Ref найден ({time.monotonic() - t0:.1f}с)")
+            else:
+                if self.verbose:
+                    self._log(f"  [agent]   ⏳ Релизов нет — фетчим HEAD...")
+                    t0 = time.monotonic()
+                clone_repo(self.state.config.git_repo, self._clone_dir, self._token)
+                if self.verbose:
+                    self._log(f"  [agent]   ✅ Клон готов ({time.monotonic() - t0:.1f}с)")
+                commit_hash = get_head_hash(self._clone_dir)
 
         if self.verbose:
             label = ref or "HEAD"
             self._log(f"\n  [agent] ▶ Создание снэпшота на {label} → {commit_hash[:8]}")
 
         md_files = scan_md_files(self._clone_dir, treeish=commit_hash)
-        snapshot_dir = os.path.join(self._work_dir, commit_hash)
+        dir_name = ref if ref else commit_hash
+        snapshot_dir = os.path.join(self._work_dir, dir_name)
 
         # Копируем все .md
         copied = 0
@@ -236,11 +268,6 @@ class DocAgent:
                 self._log(f"\n  [agent] ▶ {label} SUMMARY.md (до {n_summary} ходов)")
             self._ensure_summary(snapshot_dir, ref=commit_hash, max_turns=n_summary)
 
-        # Сохраняем первый коммит для отсчёта в watch
-        if self.state.initial_commit is None:
-            self.state.initial_commit = commit_hash
-            save_state(self.state)
-
         if check and self._generator:
             n_audit = max_turns if max_turns is not None else self._max_turns
             if self.verbose:
@@ -252,19 +279,28 @@ class DocAgent:
                 self._log(f"  [agent]   ⚠ LLM не настроен — аудит пропущен")
             result.warnings.append("LLM не настроен — аудит не выполнялся")
 
+        # Сохраняем в release-map, если указан тег релиза
+        if ref:
+            release_map = load_release_map()
+            release_map.last_documented_release = ref
+            release_map.releases[ref] = commit_hash
+            save_release_map(release_map)
+
         self._log_close()
-        self.state.last_documented_commit = commit_hash
         save_state(self.state)
 
         return result
 
-    def watch(self, branch: str, interval: int) -> None:
+    def watch(self, interval: int, branch: str = "main") -> None:
         """Запустить демон: fetch → обновление → сон."""
         self._log_open("watch")
         if self.verbose:
             self._log(f"  [agent]   ⏳ Открытие {self.state.config.git_repo}...")
             t0 = time.monotonic()
-        ensure_clone(self.state.config.git_repo, self._clone_dir, self._token)
+        ensure_clone(
+            self.state.config.git_repo, self._clone_dir, self._token,
+            verbose=self.verbose,
+        )
         if self.verbose:
             self._log(f"  [agent]   ✅ Клон готов ({time.monotonic() - t0:.1f}с)")
         if self.verbose:
@@ -285,61 +321,125 @@ class DocAgent:
     # ── Внутренние методы ────────────────────────────────
 
     def _watch_tick(self, branch: str) -> None:
-        """Один такт watch: fetch → проверить HEAD → обновить."""
+        """Один такт watch: fetch → проверить теги → обновить."""
         if self.verbose:
-            self._log(f"  [agent]   ⏳ Fetch {self.state.config.git_repo}...")
+            self._log(f"  [agent]   ⏳ Fetch тегов {self.state.config.git_repo}...")
             t0 = time.monotonic()
         fetch_repo(self._clone_dir, self._token)
         if self.verbose:
             self._log(f"  [agent]   ✅ Fetch готов ({time.monotonic() - t0:.1f}с)")
 
-        new_hash = get_head_hash(self._clone_dir, branch)
-        old_hash = self.state.last_documented_commit
+        # ── Проверка наличия новых тегов ──
+        if self.verbose:
+            self._log(f"  [agent]   🔍 Проверка наличия тегов...")
 
-        if old_hash == new_hash:
+        latest_tag = get_latest_tag(
+            self._clone_dir,
+            github_token=self._token,
+            repo_url=self.state.config.git_repo,
+        )
+
+        if not latest_tag:
             if self.verbose:
-                self._log(f"  [agent]   HEAD не изменился ({new_hash[:8]}), пропускаем")
+                self._log(f"  [agent]   Тегов нет — пропускаем")
             return
 
-        if old_hash is None:
+        old_tag = None
+        release_map = load_release_map()
+        if release_map:
+            old_tag = release_map.last_documented_release
+
+        if old_tag == latest_tag:
+            if self.verbose:
+                self._log(f"  [agent]   Релизы не изменились ({latest_tag}), пропускаем")
+            return
+
+        if old_tag is None:
+            # Первый запуск — делаем полный snapshot
             if self.verbose:
                 self._log(f"  [agent]   Первый запуск — делаем snapshot")
-            self.snapshot(check=True)
+            self.snapshot(release_tag=latest_tag, check=True)
             return
 
         if self.verbose:
-            self._log(f"  [agent]   Новый коммит: {old_hash[:8]} → {new_hash[:8]}")
+            self._log(f"  [agent]   Новый релиз: {old_tag} → {latest_tag}")
 
-        old_snapshot_dir = os.path.join(self._work_dir, old_hash)
-        new_snapshot_dir = os.path.join(self._work_dir, new_hash)
+        old_snapshot_dir = os.path.join(self._work_dir, old_tag)
+        new_snapshot_dir = os.path.join(self._work_dir, latest_tag)
 
         if not os.path.isdir(old_snapshot_dir):
-            # Старый снэпшот пропал — делаем полный снэпшот
             if self.verbose:
-                self._log(f"  [agent]   ⚠ Снэпшот {old_hash[:8]} не найден — делаем snapshot")
-            self.snapshot(check=True)
+                self._log(f"  [agent]   ⚠ Снэпшот {old_tag} не найден — делаем snapshot")
+            self.snapshot(release_tag=latest_tag, check=True)
             return
 
         result = self._update_docs(
             old_snapshot_dir=old_snapshot_dir,
             new_snapshot_dir=new_snapshot_dir,
-            from_ref=old_hash,
-            to_ref=new_hash,
+            from_ref=old_tag,
+            to_ref=latest_tag,
             copy_new_from_repo=True,
             max_turns=self._max_turns,
         )
 
+        # ── CHANGELOG.md документации ──
+        changelog_path = os.path.join(self._work_dir, "CHANGELOG.md")
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        entry_parts = [f"## {now_str} | {old_tag} → {latest_tag}"]
+        if result.docs_updated:
+            entry_parts.append(f"- Обновлено: {result.docs_updated} файлов")
+        if result.docs_added:
+            entry_parts.append(f"- Добавлено: {result.docs_added} файлов")
+            if result.added_files:
+                for f in result.added_files:
+                    entry_parts.append(f"  - {f}")
+        if result.docs_removed:
+            entry_parts.append(f"- Удалено: {result.docs_removed} файлов")
+            if result.removed_files:
+                for f in result.removed_files:
+                    entry_parts.append(f"  - {f}")
+        if not (result.docs_updated or result.docs_added or result.docs_removed):
+            entry_parts.append("- Изменений нет")
+
+        entry = "\n".join(entry_parts) + "\n"
+
+        if os.path.isfile(changelog_path):
+            with open(changelog_path, "a", encoding="utf-8") as f:
+                f.write("\n" + entry)
+        else:
+            header = "# CHANGELOG документации\n\n"
+            with open(changelog_path, "w", encoding="utf-8") as f:
+                f.write(header + entry)
+
+        if self.verbose:
+            self._log(f"  [agent]   📋 CHANGELOG: {old_tag} → {latest_tag}")
+
         # Обновляем SUMMARY в соответствии с изменениями
         if self._generator and self.verbose:
-            self._log(f"\n  [agent] ▶ Обновление SUMMARY.md для {new_hash[:8]}")
+            self._log(f"\n  [agent] ▶ Обновление SUMMARY.md для {latest_tag}")
         if self._generator:
             self._ensure_summary(
-                new_snapshot_dir, ref=new_hash,
+                new_snapshot_dir, ref=latest_tag,
                 max_turns=max(5, self._max_turns),
             )
 
-        self.state.last_documented_commit = new_hash
-        save_state(self.state)
+        # Сохраняем состояние в release-map
+        release_map = load_release_map()
+        if release_map is not None:
+            release_map.last_documented_release = latest_tag
+            # Определяем хэш коммита для тега
+            try:
+                commit_hash = subprocess.run(
+                    ["git", "rev-list", "-n1", latest_tag],
+                    capture_output=True, text=True, timeout=15,
+                    cwd=self._clone_dir,
+                ).stdout.strip()
+                if commit_hash:
+                    release_map.releases[latest_tag] = commit_hash
+            except Exception:
+                pass
+            save_release_map(release_map)
 
         if self.verbose:
             self._log(f"\n  [agent] ✔ Обновлено: {result.docs_updated}, "
@@ -373,8 +473,8 @@ class DocAgent:
         changed_code = [f for f in diff_files if not f.path.endswith(".md")]
 
         if self.verbose:
-            self._log(f"  [agent]   Diff {from_ref[:8]}..{to_ref[:8]}:"
-        f"{len(diff_files)} файлов")
+            self._log(f"  [agent]   Diff {from_ref}..{to_ref}:"
+                  f"{len(diff_files)} файлов")
 
         # ── Шаг 2: сканируем .md-файлы из старого снэпшота и из репозитория ──
         old_md_files: list[str] = self._scan_snapshot_md(old_snapshot_dir)
@@ -432,7 +532,7 @@ class DocAgent:
                 dest.write_text(new_content, encoding="utf-8")
                 updated += 1
                 if self.verbose:
-                    self._log(f"  [agent]   ✏️ {rel_path}")
+                    self._log(f"  [agent]   ↔ {rel_path} (синхронизирован из репозитория)")
 
         result.docs_updated = updated
 
@@ -1003,8 +1103,7 @@ class DocAgent:
         - reasoning_content (DeepSeek R1, OpenAI o-series)
         - model_extra.reasoning_content
 
-        В консоль — только первые 30 строк (чтобы не спамить).
-        В лог-файл — полностью, без обрезки.
+        Формат: 🤔 первая мысль, │ разделители, └ последняя.
         """
         reasoning = None
         if hasattr(msg, "reasoning_content") and msg.reasoning_content:
@@ -1015,28 +1114,55 @@ class DocAgent:
 
         if reasoning:
             import shutil, textwrap
-            width = shutil.get_terminal_size((80, 20)).columns - 10
+            term_width = shutil.get_terminal_size((80, 20)).columns
+            # Минус префикс "  [agent]     " (13) + "🤔/│/└ " (2) = 15
+            width = min(term_width - 15, 80)
             if width < 40:
                 width = 40
             lines = reasoning.strip().split("\n")
+            # Разбиваем на параграфы
+            paragraphs = []
+            buf = []
+            for line in lines:
+                if line.strip():
+                    buf.append(line)
+                elif buf:
+                    paragraphs.append(" ".join(buf))
+                    buf = []
+            if buf:
+                paragraphs.append(" ".join(buf))
 
-            # ── Консоль: только первые 30 строк ──
-            for line in lines[:30]:
-                wrapped = textwrap.fill(line, width=width)
-                for sub in wrapped.split("\n"):
-                    print(f"  \x1b[90m🤔 {sub}\x1b[0m")
-            if len(lines) > 30:
-                print(f"  \x1b[90m   … (ещё {len(lines) - 30} строк)\x1b[0m")
+            if not paragraphs:
+                return
 
-            # ── Лог-файл: все строки без обрезки ──
-            if self._log_enabled and self._log_file:
-                now = datetime.now().strftime("%H:%M:%S")
-                for line in lines:
-                    wrapped = textwrap.fill(line, width=width)
-                    for sub in wrapped.split("\n"):
-                        clean = re.sub(r'\x1b\[[0-9;]*m', '', f"🤔 {sub}")
-                        self._log_file.write(f"[{now}] {clean}\n")
-                self._log_file.flush()
+            # Склеиваем параграфы в плоский список строк с pipe-форматом
+            out_lines: list[str] = []
+            for i, para in enumerate(paragraphs):
+                wrapped = textwrap.fill(para, width=width).split("\n")
+                if i == 0:
+                    out_lines.append(f"  [agent]     \x1b[33m🤔 {wrapped[0]}\x1b[0m")
+                    for sub in wrapped[1:]:
+                        out_lines.append(f"  [agent]     \x1b[33m│ {sub}\x1b[0m")
+                elif i == len(paragraphs) - 1:
+                    out_lines.append(f"  [agent]     \x1b[33m│\x1b[0m")
+                    out_lines.append(f"  [agent]     \x1b[33m└ {wrapped[0]}\x1b[0m")
+                    for sub in wrapped[1:]:
+                        out_lines.append(f"  [agent]     \x1b[33m  {sub}\x1b[0m")
+                else:
+                    out_lines.append(f"  [agent]     \x1b[33m│\x1b[0m")
+                    out_lines.append(f"  [agent]     \x1b[33m│ {wrapped[0]}\x1b[0m")
+                    for sub in wrapped[1:]:
+                        out_lines.append(f"  [agent]     \x1b[33m│ {sub}\x1b[0m")
+
+            # Лимит 30 строк, остальное — "… (ещё N строк)"
+            MAX_LINES = 30
+            if len(out_lines) > MAX_LINES:
+                for line in out_lines[:MAX_LINES]:
+                    self._log(line)
+                self._log(f"  [agent]     \x1b[90m… (ещё {len(out_lines) - MAX_LINES} строк)\x1b[0m")
+            else:
+                for line in out_lines:
+                    self._log(line)
 
     def _collect_changelog(self, from_ref: str, to_ref: str) -> str:
         """Собрать изменения между двумя ref'ами.
