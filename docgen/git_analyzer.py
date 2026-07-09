@@ -323,6 +323,6 @@ def get_snapshot_versions(work_dir: str) -> list[dict]:
         if entry.is_dir() and not entry.name.startswith("."):
             # Папка названа хэшем коммита — 7+ hex-символов
             if re.fullmatch(r"[0-9a-f]{7,40}", entry.name):
-                versions.append({"hash": entry.name, "dir": str(entry)})
+                versions.append({"hash": entry.name, "hash8": entry.name[:8], "dir": str(entry)})
     versions.sort(key=lambda v: v["hash"], reverse=True)
     return versions

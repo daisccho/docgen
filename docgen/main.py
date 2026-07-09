@@ -229,5 +229,7 @@ def versions() -> None:
 
     click.echo(f"Версии ({len(snaps)}):")
     for s in snaps:
-        click.echo(f"  • {s['hash']}")
+        current = state.last_documented_commit and state.last_documented_commit.startswith(s["hash"])
+        marker = " ★" if current else ""
+        click.echo(f"  {s['hash8']}{marker}")
     click.echo()
