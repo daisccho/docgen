@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "docgen"
 version = "0.0.1"
@@ -18,5 +22,6 @@ dependencies = [
 [project.scripts]
 docgen = "docgen.main:cli"
 
-[tool.setuptools.packages.find]
-include = ["docgen*"]
+[tool.setuptools]
+packages = ["docgen"]
+package-dir = {docgen = "."}

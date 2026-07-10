@@ -101,26 +101,53 @@ TOOL_DEFS = [
     {
         "type": "function",
         "function": {
+            "name": "read_changelog",
+            "description": "Прочитать CHANGELOG.md — историю изменений документации. "
+                           "Если файла нет — будет сообщено. Вызови в начале, чтобы "
+                           "узнать, какие записи уже есть, и не создавать дубликаты.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "submit_changelog_entry",
+            "description": "Добавить новую запись в CHANGELOG.md. "
+                           "Запись будет дописана в конец файла. "
+                           "Предыдущие записи не изменятся. "
+                           "Не нужно читать старый CHANGELOG — просто вызови "
+                           "этот инструмент с текстом новой записи.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "Текст новой записи для CHANGELOG.md. "
+                                       "Только новая запись, без заголовка # CHANGELOG "
+                                       "и без старых записей.",
+                    },
+                },
+                "required": ["content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "collect_changelog",
-            "description": "Собрать список изменений между двумя ref'ами (тегами, "
-                           "хэшами коммитов или ветками). "
+            "description": "Собрать список изменений между двумя релизами. "
                            "Читает CHANGELOG.md файлы, git commit messages и "
                            "собирает консолидированный changelog. "
                            "Вызывай в начале фазы update или audit, чтобы понять, "
                            "какие изменения произошли в коде.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "from_ref": {
-                        "type": "string",
-                        "description": "Начальный ref (тег, хэш или ветка)",
-                    },
-                    "to_ref": {
-                        "type": "string",
-                        "description": "Конечный ref (тег, хэш или ветка)",
-                    },
-                },
-                "required": ["from_ref", "to_ref"],
+                "properties": {},
+                "required": [],
             },
         },
     },
@@ -162,6 +189,7 @@ class DocAgent:
         self._log_enabled = log
         self._log_file: Optional[Any] = None
         self._summary_path = os.path.join(self._work_dir, "SUMMARY.md")
+        self._changelog_path = os.path.join(self._work_dir, "CHANGELOG.md")
 
     # ── Открытые методы ─────────────────────────────────
 
@@ -384,37 +412,26 @@ class DocAgent:
         )
 
         # ── CHANGELOG.md документации ──
-        changelog_path = os.path.join(self._work_dir, "CHANGELOG.md")
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        entry_parts = [f"## {now_str} | {old_tag} → {latest_tag}"]
-        if result.docs_updated:
-            entry_parts.append(f"- Обновлено: {result.docs_updated} файлов")
-        if result.docs_added:
-            entry_parts.append(f"- Добавлено: {result.docs_added} файлов")
-            if result.added_files:
-                for f in result.added_files:
-                    entry_parts.append(f"  - {f}")
-        if result.docs_removed:
-            entry_parts.append(f"- Удалено: {result.docs_removed} файлов")
-            if result.removed_files:
-                for f in result.removed_files:
-                    entry_parts.append(f"  - {f}")
-        if not (result.docs_updated or result.docs_added or result.docs_removed):
-            entry_parts.append("- Изменений нет")
-
-        entry = "\n".join(entry_parts) + "\n"
-
-        if os.path.isfile(changelog_path):
-            with open(changelog_path, "a", encoding="utf-8") as f:
-                f.write("\n" + entry)
-        else:
-            header = "# CHANGELOG документации\n\n"
-            with open(changelog_path, "w", encoding="utf-8") as f:
-                f.write(header + entry)
-
         if self.verbose:
-            self._log(f"  [agent]   📋 CHANGELOG: {old_tag} → {latest_tag}")
+            self._log(f"\n  [agent] ▶ Создание CHANGELOG.md: {old_tag} → {latest_tag}")
+
+        # Собираем .md-файлы, изменённые разработчиками (из git diff между версиями)
+        dev_md_proc = subprocess.run(
+            ["git", "diff", f"{old_tag}..{latest_tag}", "--name-only", "--", "*.md"],
+            capture_output=True, text=True, cwd=self._clone_dir,
+        )
+        developer_md_files = [
+            f for f in dev_md_proc.stdout.strip().split("\n") if f
+        ] if dev_md_proc.returncode == 0 else []
+
+        self._ensure_changelog(
+            old_tag, latest_tag,
+            max_turns=self._max_turns,
+            updated_files=result.updated_files,
+            added_files=result.added_files,
+            removed_files=result.removed_files,
+            developer_md_files=developer_md_files,
+        )
 
         # Обновляем SUMMARY в соответствии с изменениями
         if self._generator and self.verbose:
@@ -526,6 +543,8 @@ class DocAgent:
                 code_diffs=relevant,
                 file_path=rel_path,
                 max_turns=max_turns,
+                from_ref=from_ref,
+                to_ref=to_ref,
             )
             if new_content:
                 dest = Path(new_snapshot_dir) / rel_path
@@ -721,13 +740,13 @@ class DocAgent:
             "    Вызови в самом начале, чтобы быстро понять архитектуру.\n"
             "  • write_summary — после изучения кода сохрани описание "
             "проекта для будущих запусков.\n"
-            "  • collect_changelog(from_ref, to_ref) — собрать список "
+            "  • collect_changelog — собрать список "
             "изменений между версиями: CHANGELOG'и, подобные им файлы "
             "и комментарии коммитов.\n"
             "  • terminal — изучай код, diff'ы, читай файлы.\n\n"
             "📋 Рекомендуемый порядок:\n"
             "1. Сначала read_summary — пойми, что за проект.\n"
-            "2. Затем collect_changelog(from_ref, to_ref) — узнай, "
+            "2. Затем collect_changelog — узнай, "
             "что изменилось (агент сам найдёт CHANGELOG-подобные файлы).\n"
             "3. Используй terminal для точечной проверки кода.\n\n"
             "Правила:\n"
@@ -770,7 +789,8 @@ class DocAgent:
             self._log(f"  [agent]   🤖 Агентный маппинг: {total_changed} файлов кода →"
         f"{total_md} .md")
 
-        content = self._run_tool_loop(client, messages, "LLM-маппинг", max_turns)
+        content = self._run_tool_loop(client, messages, "LLM-маппинг", max_turns,
+                                      from_ref=from_ref, to_ref=to_ref)
         if not content:
             if self.verbose:
                 self._log(f"  [agent]   ⚠ Агентный маппинг вернул пустой ответ")
@@ -815,6 +835,8 @@ class DocAgent:
         code_diffs: dict[str, str],
         file_path: str,
         max_turns: int = 10,
+        from_ref: Optional[str] = None,
+        to_ref: Optional[str] = None,
     ) -> Optional[str]:
         """Обновить .md-файл через LLM с доступом к терминалу.
 
@@ -882,7 +904,8 @@ class DocAgent:
             {"role": "user", "content": user_prompt},
         ]
 
-        content = self._run_tool_loop(client, messages, file_path, max_turns)
+        content = self._run_tool_loop(client, messages, file_path, max_turns,
+                                      from_ref=from_ref, to_ref=to_ref)
         if not content or len(content) < 50:
             return old_doc
         return content
@@ -983,6 +1006,8 @@ class DocAgent:
         messages: list[dict[str, Any]],
         file_path: str,
         max_turns: int = 10,
+        from_ref: Optional[str] = None,
+        to_ref: Optional[str] = None,
     ) -> Optional[str]:
         """Выполнить цикл LLM с инструментами.
 
@@ -1087,16 +1112,38 @@ class DocAgent:
                     if self.verbose:
                         self._log(f"  [agent]     📝 SUMMARY.md записан")
 
-                elif tc.function.name == "collect_changelog":
+                elif tc.function.name == "read_changelog":
+                    try:
+                        if os.path.isfile(self._changelog_path):
+                            with open(self._changelog_path, encoding="utf-8") as f:
+                                content = f.read()
+                            result = f"Содержимое CHANGELOG.md ({len(content)} символов):\n\n{content}"
+                        else:
+                            result = "CHANGELOG.md ещё не создан. Создай новую запись."
+                    except Exception as exc:
+                        result = f"[ERROR: {exc}]"
+
+                elif tc.function.name == "submit_changelog_entry":
                     try:
                         args = json.loads(tc.function.arguments)
-                        from_ref = args.get("from_ref", "")
-                        to_ref = args.get("to_ref", "")
-                        result = self._collect_changelog(from_ref, to_ref)
+                        content = args.get("content", "")
+                        header = "# CHANGELOG документации\n\n"
+                        if not os.path.isfile(self._changelog_path):
+                            with open(self._changelog_path, "w", encoding="utf-8") as f:
+                                f.write(header)
+                        with open(self._changelog_path, "a", encoding="utf-8") as f:
+                            f.write("\n" + content.strip() + "\n")
+                        result = f"Запись добавлена в CHANGELOG.md ({len(content)} символов)."
                     except (json.JSONDecodeError, KeyError) as exc:
                         result = f"[ERROR: невалидные аргументы: {exc}]"
                     except Exception as exc:
                         result = f"[ERROR: {exc}]"
+
+                elif tc.function.name == "collect_changelog":
+                    if from_ref and to_ref:
+                        result = self._collect_changelog(from_ref, to_ref)
+                    else:
+                        result = "[ERROR: ref'ы не заданы — collect_changelog требует контекст]"
                     if self.verbose:
                         self._log(f"  [agent]     📋 Changelog собран")
 
@@ -1201,10 +1248,10 @@ class DocAgent:
             self._log("  [agent]     ⏳ Сбор коммитов и CHANGELOG...")
         t0 = time.monotonic()
 
-        # 1. Коммиты между ref'ами
+        # 1. Коммиты между ref'ами (с телом сообщения)
         try:
             log_output = subprocess.run(
-                ["git", "log", "--oneline", "--no-decorate",
+                ["git", "log", "--format=%h %s%n%b", "--no-decorate",
                  f"{from_ref}..{to_ref}"],
                 capture_output=True, text=True, timeout=30, cwd=clone,
             )
@@ -1222,11 +1269,13 @@ class DocAgent:
             "*changelog*", "*changes*", "*release*notes*",
         ]
         found_changelogs: list[str] = []
+        # Максимум символов на весь changelog
+        MAX_CHARS = 8000
 
         try:
             for pattern in changelog_patterns:
                 ls = subprocess.run(
-                    ["git", "ls-files", "--", pattern],
+                    ["git", "ls-tree", "--name-only", "-r", to_ref, "--", pattern],
                     capture_output=True, text=True, timeout=15, cwd=clone,
                 )
                 for p in ls.stdout.strip().split("\n"):
@@ -1240,7 +1289,13 @@ class DocAgent:
             if found_changelogs:
                 parts.append(f"### Найденные changelog-файлы\n\n{chr(10).join(f'- {p}' for p in found_changelogs)}")
 
-                for path in found_changelogs[:15]:
+                for i, path in enumerate(found_changelogs):
+                    # Проверяем общий размер перед добавлением
+                    current_size = sum(len(p) for p in parts)
+                    if current_size > MAX_CHARS:
+                        remaining = len(found_changelogs) - i
+                        parts.append(f"… (ещё {remaining} changelog-файлов пропущено)")
+                        break
                     # Сначала проверяем, изменился ли файл
                     diff = subprocess.run(
                         ["git", "diff", f"{from_ref}..{to_ref}", "--", path],
@@ -1296,8 +1351,8 @@ class DocAgent:
             "Ты — аналитик проекта. Твоя задача — изучить код в репозитории "
             "и написать SUMMARY.md — подробное описание проекта.\n\n"
             "У тебя есть инструменты:\n"
-            f"  • terminal — выполняй команды в папке {self._clone_dir} "
-            "(bare-репозиторий).\n"
+            "  • terminal — выполняй команды в папке "
+            f"{self._clone_dir} (bare-репозиторий).\n"
             "    ВАЖНО: это bare-репозиторий (только git-объекты,\n"
             "    без рабочей директории). Команды ls, cat там покажут только\n"
             "    метаданные git, НЕ исходный код.\n"
@@ -1309,16 +1364,53 @@ class DocAgent:
             "инструмент после изучения.\n\n"
             "Директория снэпшота (../<хэш>/) содержит ТОЛЬКО .md-файлы "
             "документации. Для изучения кода используй git show.\n\n"
-            "SUMMARY.md должен включать:\n"
-            "1. Назначение проекта (кратко, 2-3 предложения)\n"
-            "2. Архитектура: основные модули/пакеты, их ответственность\n"
-            "3. Ключевые технологии и зависимости\n"
-            "4. Структура репозитория (основные директории)\n"
-            "5. Принятые соглашения (стиль кода, naming, архитектурные решения)\n"
-            "6. Любая другая информация, полезная для понимания проекта\n\n"
-            "Пиши на русском языке.\n"
-            "После изучения вызови write_summary с полным текстом SUMMARY.md.\n"
-            "Не возвращай SUMMARY как финальный ответ — это сделает write_summary."
+            "SUMMARY.md должен иметь структуру:\n"
+            "1. ## Назначение проекта — 2-3 абзаца: чем занимается, "
+            "ключевая философия, основная ценность.\n"
+            "2. ## Архитектура и пакеты — для каждого публикуемого "
+            "пакета/модуля: название, назначение, структура, основные "
+            "компоненты/классы, ключевые зависимости. Если проект — "
+            "монорепозиторий, группируй по назначению.\n"
+            "3. ## Ключевые технологии и зависимости — язык, рантайм, "
+            "сборка, тестирование, основные SDK/библиотеки. Без деталей "
+            "реализации, только стек.\n"
+            "4. ## Структура репозитория — ascii-дерево с краткими "
+            "пояснениями.\n"
+            "5. ## Принятые соглашения — подразделы: Код и стиль, "
+            "Архитектурные решения, Документация.\n"
+            "6. ## О проекте — мета-информация по репозиторию. "
+            "Держатель (holder) — название организации или пользователя, "
+            "которому принадлежит репозиторий на GitHub, "
+            "без дополнительных персоналий. Лицензия (из LICENSE), "
+            "сайт проекта (из README.md, package.json homepage), "
+            "npm-пакеты, сообщество (Discord и т.п.), "
+            "актуальная версия: \"<тег> (<короткий хэш 8 символов>) "
+            "от <дата коммита>\". Все элементы — единый список "
+            "без дубликатов.\n"
+            "    Держателя бери из git remote URL: "
+            "`git config --get remote.origin.url` — "
+            "извлеки owner между github.com/ и /repo-name.\n"
+            "    Лицензию читай из LICENSE "
+            "(строка 'MIT License', 'Apache', 'GPL' и т.п.) — "
+            "не путай с Copyright (юридической атрибуцией автора).\n"
+            "    README.md, package.json читай через "
+            "git show {ref}:<путь>.\n"
+            "    Актуальную версию (тег, короткий хэш, дату) получи через:\n"
+            "      git log -1 --format='%h %as' {ref}\n"
+            "    НЕ включай сюда changelog / изменения между версиями "
+            "— для этого есть отдельный CHANGELOG.md.\n"
+            "    НЕ перечисляй мейнтейнеров, коммиттеров, участников "
+            "организации, copyright holder'ов — только держатель "
+            "(одна строка из git remote).\n\n"
+            "Правила:\n"
+            "- Пиши на русском языке.\n"
+            "- Размер: 200-800 строк. Достаточно подробно, чтобы "
+            "другой агент мог понять проект без чтения кода.\n"
+            "- Факты проверяй через терминал (git show) — не выдумывай.\n"
+            "- Если есть CHANGELOG.md — прочитай его для контекста "
+            "изменений, но не копируй содержимое в SUMMARY.md.\n"
+            "- После изучения вызови write_summary с полным текстом "
+            "SUMMARY.md.\n"
         )
 
         if old_summary:
@@ -1347,6 +1439,163 @@ class DocAgent:
         ]
 
         self._run_tool_loop(client, messages, "SUMMARY.md", max_turns)
+
+    def _ensure_changelog(
+        self,
+        old_tag: str,
+        latest_tag: str,
+        max_turns: int = 8,
+        updated_files: Optional[list[str]] = None,
+        added_files: Optional[list[str]] = None,
+        removed_files: Optional[list[str]] = None,
+        developer_md_files: Optional[list[str]] = None,
+    ) -> None:
+        """Создать или дополнить CHANGELOG.md, запустив LLM-агента.
+
+        Args:
+            old_tag: Старый тег (от которого).
+            latest_tag: Новый тег (до которого).
+            max_turns: Максимум ходов агента.
+        """
+        if not self._generator:
+            return
+        client = self._generator._client
+        if not client:
+            return
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        system_prompt = (
+            "Ты — редактор CHANGELOG.md. Этот файл содержит историю "
+            "изменений только документации анализируемого проекта. "
+            "Служебные файлы самого инструмента документирования "
+            "(SUMMARY.md, CHANGELOG.md и т.п.) в него не попадают.\n\n"
+            "Твоя задача — изучить изменения "
+            f"между {old_tag} и {latest_tag} и написать новую запись "
+            "для CHANGELOG.md.\n\n"
+            "У тебя есть инструменты:\n"
+            "  • terminal — выполняй команды в папке "
+            f"{self._clone_dir} (bare-репозиторий).\n"
+            "    ВАЖНО: это bare-репозиторий (только git-объекты).\n"
+            "    Читай файлы и дифы через:\n"
+            f"      git show {latest_tag}:<путь>\n"
+            f"      git diff {old_tag}..{latest_tag} -- <путь>\n\n"
+            "  • collect_changelog — собрать коммиты и changelog-файлы "
+            f"проекта между {old_tag} и {latest_tag}.\n"
+            "  • submit_changelog_entry — добавить новую запись "
+            "в CHANGELOG.md. Вызови этот инструмент с текстом новой "
+            "записи. Предыдущие записи не пострадают — заголовок "
+            "добавится автоматически.\n\n"
+            "Каждая запись содержит две секции:\n"
+            "1. Изменения в проекте — на основе коммитов между "
+            f"{old_tag} и {latest_tag} (git log, collect_changelog).\n"
+            "2. Изменения в документации — какие .md-файлы были "
+            "добавлены, удалены или изменены.\n"
+            "   Внутри этой секции две подсекции:\n"
+            "   - Изменено docgen — файлы, которые обработал docgen.\n"
+            "   - Изменено разработчиками — файлы, которые "
+            "изменили разработчики в git.\n\n"
+            "Формат записи:\n"
+            f"## [{now_str}] {old_tag} -> {latest_tag}\n\n"
+            "### Изменения в проекте\n"
+            "2-5 предложений: ключевые изменения в коде проекта "
+            "(новые фичи, исправления, рефакторинг). "
+            "Бери информацию из коммитов.\n\n"
+            "### Изменения в документации\n"
+            "#### Изменено docgen\n"
+            "- файл.md (кратко: что сделано)\n\n"
+            "#### Изменено разработчиками\n"
+            "- файл.md (кратко: что изменилось)\n\n"
+            "Подсекции включай только если есть соответствующие "
+            "изменения.\n\n"
+            "ВАЖНЫЕ ПРАВИЛА:\n"
+            "- CHANGELOG.md документирует исключительно изменения "
+            "документации анализируемого проекта. "
+            "Никакой информации о работе инструмента "
+            "документирования (обновлении SUMMARY.md, "
+            "создании/изменении самого CHANGELOG.md или других "
+            "служебных файлов) здесь быть не должно.\n"
+            "- НЕ пиши отдельную запись про работу docgen — "
+            "только одна запись на переход между версиями.\n"
+            "- Пиши на русском языке.\n"
+            "- Факты проверяй через collect_changelog и terminal.\n"
+            "- Сначала изучи изменения, затем вызови "
+            "submit_changelog_entry с готовой записью.\n"
+        )
+
+        # Формируем информацию о файлах, обработанных docgen и разработчиками
+        docgen_info_parts = []
+        if added_files:
+            docgen_info_parts.append(f"  - Добавлено docgen: {', '.join(added_files)}")
+        if removed_files:
+            docgen_info_parts.append(f"  - Удалено docgen: {', '.join(removed_files)}")
+        if updated_files:
+            docgen_info_parts.append(f"  - Обновлено docgen: {', '.join(updated_files)}")
+        docgen_info = "\n".join(docgen_info_parts)
+
+        dev_info = ""
+        if developer_md_files:
+            dev_info = (
+                ".md-файлы, изменённые разработчиками "
+                f"(из git diff {old_tag}..{latest_tag}):\n"
+                + "\n".join(f"  - {f}" for f in developer_md_files)
+            )
+
+        changelog_exists = os.path.isfile(self._changelog_path)
+
+        # Собираем контекст для агента
+        context_parts = []
+        if docgen_info:
+            context_parts.append(
+                "Файлы, обработанные docgen "
+                f"({old_tag} -> {latest_tag}):\n{docgen_info}"
+            )
+        if dev_info:
+            context_parts.append(dev_info)
+        context_str = "\n\n".join(context_parts)
+
+        instructions = ""
+        if docgen_info and dev_info:
+            instructions = (
+                "Раздели изменения на две подсекции:\n"
+                "  - Изменено docgen — файлы, которые docgen "
+                "обновил/добавил/удал самостоятельно.\n"
+                "  - Изменено разработчиками — .md-файлы, которые "
+                "изменились между версиями в git (разработчики "
+                "сами обновили документацию).\n\n"
+                "Файлы могут пересекаться — в таком случае укажи "
+                "в обеих подсекциях."
+            )
+        elif docgen_info and not dev_info:
+            instructions = (
+                "Все изменения в .md-файлах сделаны docgen — "
+                "укажи это в секции 'Изменено docgen'."
+            )
+        elif not docgen_info and dev_info:
+            instructions = (
+                "Разработчики сами обновили .md-файлы — "
+                "укажи это в секции 'Изменено разработчиками'. "
+                "Docgen ничего не менял."
+            )
+
+        user_prompt = (
+            f"Напиши новую запись для CHANGELOG.md о переходе "
+            f"{old_tag} -> {latest_tag} ({now_str}).\n\n"
+            f"{context_str}\n\n"
+            f"{instructions}\n\n"
+            "Изучи изменения через collect_changelog и terminal, "
+            "затем вызови submit_changelog_entry."
+        )
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        self._run_tool_loop(
+            client, messages, "CHANGELOG.md", max_turns,
+            from_ref=old_tag, to_ref=latest_tag,
+        )
 
     # ── Логирование ──────────────────────────────────────
 

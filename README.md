@@ -16,13 +16,14 @@ cd docgen
 python3 -m venv .venv
 source .venv/bin/activate
 ```
-Обновляем pip и устанавливаем зависимости:
+Обновляем pip и устанавливаем пакет в режиме разработки:
 ```bash
 pip install --upgrade pip
 pip install -e .
 ```
 > [!NOTE]
-> pip install с флагом -e позволит вызвать команду docgen из любого места в вашей ОС.
+> `pip install -e .` устанавливает команду `docgen` глобально — можно вызывать из любого места.
+> При переключении на новую версию (например, после `git pull`) достаточно снова выполнить `pip install -e .`, чтобы обновить entry point.
 
 # Доступные команды
 - **docgen init [OPTIONS]**  
