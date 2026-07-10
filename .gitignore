@@ -1,5 +1,5 @@
 # Byte-compiled / optimized / DLL files
-docgen/__pycache__/
+__pycache__/
 *.py[codz]
 *$py.class
 
@@ -152,10 +152,10 @@ activemq-data/
 # Environments
 .env
 .envrc
-# Docgen generated files
+
+# docgen
 .docgen.yaml
 .release-map.yaml
-CHANGELOG.md
 .clone/
 
 # Environments
