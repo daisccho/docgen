@@ -46,6 +46,7 @@ class GenerationResult(BaseModel):
     """Результат генерации документации для одной версии."""
     commit_hash: str = Field(description="Хэш коммита")
     output_dir: str = Field(description="Путь к папке с результатом")
+    release_tag: Optional[str] = Field(None, description="Тег релиза, если задан")
     docs_updated: int = Field(0, description="Сколько .md обновлено через LLM")
     docs_copied: int = Field(0, description="Сколько .md скопировано без изменений")
     docs_added: int = Field(0, description="Сколько .md добавлено (новые файлы)")

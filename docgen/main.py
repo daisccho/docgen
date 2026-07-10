@@ -168,7 +168,8 @@ def snapshot(ctx: click.Context, release: Optional[str],
         click.secho(f"❌ {exc}", fg="red", err=True)
         sys.exit(1)
 
-    _echo_ok(f"Снэпшот создан: {result.commit_hash[:8]}")
+    label = result.release_tag or result.commit_hash[:8]
+    _echo_ok(f"Снэпшот создан: {label}")
     _echo_info(f"Файлов скопировано: {result.docs_copied}")
     if result.docs_updated:
         _echo_info(f"Обновлено через LLM: {result.docs_updated}")

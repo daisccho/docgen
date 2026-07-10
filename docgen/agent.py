@@ -256,6 +256,7 @@ class DocAgent:
         result = GenerationResult(
             commit_hash=commit_hash,
             output_dir=snapshot_dir,
+            release_tag=ref,
             docs_copied=copied,
         )
 
@@ -942,6 +943,23 @@ class DocAgent:
                 self._log(f"  [agent]     ⚠ Ошибка: {exc}")
             return f"[ERROR: {exc}]"
 
+    def _format_cmd_line(self, cmd: str) -> list[str]:
+        """Отформатировать команду с переносом по ширине терминала."""
+        import shutil, textwrap
+        term_width = shutil.get_terminal_size((80, 20)).columns
+        prefix = "  [agent]     🔧 $ "
+        cont_prefix = " " * len(prefix)
+        wrap_width = term_width - len(prefix)
+        if wrap_width < 40:
+            wrap_width = 40
+        lines = textwrap.wrap(cmd, width=wrap_width)
+        if not lines:
+            return [f"{prefix}"]
+        result = [f"{prefix}{lines[0]}"]
+        for line in lines[1:]:
+            result.append(f"{cont_prefix}{line}")
+        return result
+
     @staticmethod
     def _format_diffs_for_prompt(code_diffs: dict[str, str]) -> str:
         """Собрать code diffs в текст для промпта (с лимитом ~6000 символов)."""
@@ -1036,7 +1054,8 @@ class DocAgent:
                         result = "[ERROR: невалидные аргументы]"
                     else:
                         if self.verbose:
-                            self._log(f"  [agent]     🔧 $ {cmd[:120]}")
+                            for line in self._format_cmd_line(cmd):
+                                self._log(line)
                         result = self._run_terminal(cmd)
                         if self.verbose:
                             self._log(f"  [agent]     ✅ Команда выполнена"
@@ -1141,8 +1160,11 @@ class DocAgent:
                 wrapped = textwrap.fill(para, width=width).split("\n")
                 if i == 0:
                     out_lines.append(f"  [agent]     \x1b[33m🤔 {wrapped[0]}\x1b[0m")
-                    for sub in wrapped[1:]:
-                        out_lines.append(f"  [agent]     \x1b[33m│ {sub}\x1b[0m")
+                    for j, sub in enumerate(wrapped[1:]):
+                        if i == len(paragraphs) - 1 and j == len(wrapped) - 2:
+                            out_lines.append(f"  [agent]     \x1b[33m└ {sub}\x1b[0m")
+                        else:
+                            out_lines.append(f"  [agent]     \x1b[33m│ {sub}\x1b[0m")
                 elif i == len(paragraphs) - 1:
                     out_lines.append(f"  [agent]     \x1b[33m│\x1b[0m")
                     out_lines.append(f"  [agent]     \x1b[33m└ {wrapped[0]}\x1b[0m")
@@ -1274,11 +1296,12 @@ class DocAgent:
             "Ты — аналитик проекта. Твоя задача — изучить код в репозитории "
             "и написать SUMMARY.md — подробное описание проекта.\n\n"
             "У тебя есть инструменты:\n"
-            "  • terminal — выполняй команды в корне bare-репозитория (.clone/).\n"
-            "    ВАЖНО: .clone/ — это bare-репозиторий (только git-объекты,\n"
+            f"  • terminal — выполняй команды в папке {self._clone_dir} "
+            "(bare-репозиторий).\n"
+            "    ВАЖНО: это bare-репозиторий (только git-объекты,\n"
             "    без рабочей директории). Команды ls, cat там покажут только\n"
             "    метаданные git, НЕ исходный код.\n"
-            f"    Ты документируешь версию {ref[:12]}. Чтобы прочитать файл\n"
+            f"    Ты документируешь версию {ref}. Чтобы прочитать файл\n"
             "    из этой версии кода, всегда используй:\n"
             f"      git show {ref}:<путь>\n\n"
             "  • read_summary — прочитать текущий SUMMARY.md (если есть).\n"
@@ -1301,17 +1324,18 @@ class DocAgent:
         if old_summary:
             user_prompt = (
                 f"Ранее созданный SUMMARY.md:\n\n{old_summary[:12000]}\n\n"
-                f"Проверь, актуален ли он для версии {ref[:12]}. "
+                f"Проверь, актуален ли он для версии {ref}. "
                 "Изучи текущую структуру кода "
-                f"через 'git show {ref}:<путь>' (bare-репозиторий .clone/), "
+                f"через 'git show {ref}:<путь>' (ты в {self._clone_dir}), "
                 "сравни с описанием в SUMMARY и обнови при необходимости. "
                 "Вызови write_summary с обновлённой версией."
             )
         else:
             user_prompt = (
-                f"Изучи код в репозитории для версии {ref[:12]} и создай SUMMARY.md.\n"
+                f"Изучи код в репозитории для версии {ref} и создай SUMMARY.md.\n"
                 "Используй terminal для просмотра структуры.\n"
-                f"ВАЖНО: .clone/ — bare-репозиторий. Читай файлы кода через:\n"
+                f"ВАЖНО: ты в {self._clone_dir} — bare-репозиторий. "
+                "Читай файлы кода через:\n"
                 f"  git show {ref}:packages/ai/src/index.ts\n"
                 f"  git ls-tree --name-only {ref} packages/\n\n"
                 "Затем вызови write_summary, чтобы сохранить описание проекта."
@@ -1438,15 +1462,16 @@ class DocAgent:
 
         system_prompt = (
             "Ты — аудитор документации. Проверь, соответствует ли этот "
-            f".md-файл коду версии {ref[:12]} в репозитории.\n\n"
+            f".md-файл коду версии {ref} в репозитории.\n\n"
             "У тебя есть доступ к терминалу и специальным инструментам:\n"
             "  • read_summary — прочитать описание проекта (архитектура, "
             "модули, соглашения).\n"
             "  • collect_changelog — понять, какие изменения произошли "
             "в коде (CHANGELOG'и + коммиты).\n"
-            "  • terminal — выполняй команды в корне bare-репозитория (.clone/).\n"
-            "    ВАЖНО: .clone/ — bare-репозиторий. Чтобы прочитать "
-            f"файл из кода версии {ref[:12]}, используй:\n"
+            f"  • terminal — выполняй команды в папке {self._clone_dir} "
+            "(bare-репозиторий).\n"
+            "    ВАЖНО: это bare-репозиторий. Чтобы прочитать "
+            f"файл из кода версии {ref}, используй:\n"
             f"      git show {ref}:<путь>\n"
             "    Например:\n"
             "      git show {ref}:packages/ai/src/index.ts\n"
