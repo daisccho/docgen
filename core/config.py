@@ -8,7 +8,7 @@ from typing import Optional
 
 import yaml
 
-from docgen.models import ProjectConfig, ProjectState, ReleaseMap
+from core.models import ProjectConfig, ProjectState, ReleaseMap
 
 CONFIG_FILENAME = ".docgen.yaml"
 RELEASE_MAP_FILENAME = ".release-map.yaml"
@@ -116,6 +116,7 @@ def init_project(
     github_token_env: Optional[str] = None,
     project_name: Optional[str] = None,
     max_turns: Optional[int] = None,
+    llm_provider: Optional[str] = None,
 ) -> ProjectState:
     """Инициализировать новый проект docgen.
 
@@ -135,6 +136,8 @@ def init_project(
         state.config.project_name = project_name
     if max_turns is not None:
         state.config.max_turns = max_turns
+    if llm_provider:
+        state.config.llm_provider = llm_provider
     save_state(state)
     save_release_map(ReleaseMap())
     return state

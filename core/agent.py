@@ -11,19 +11,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from docgen.config import (
+from core.config import (
     find_project_root,
     load_release_map,
     save_release_map,
     save_state,
 )
-from docgen.doc_generator import DocGenerator
-from docgen.git_analyzer import (
+from core.doc_generator import DocGenerator
+from core.git_analyzer import (
     clone_repo,
     ensure_clone,
     ensure_ref_available,
     extract_file_from_repo,
     fetch_repo,
+    fetch_tags,
     get_deleted_md_files,
     get_diff_files,
     get_head_hash,
@@ -32,9 +33,10 @@ from docgen.git_analyzer import (
     get_raw_diffs,
     get_snapshot_versions,
     read_file_from_repo,
+    sanitize_tag_name,
     scan_md_files,
 )
-from docgen.models import GenerationResult, ProjectState
+from core.models import GenerationResult, ProjectState
 
 CLONE_DIR = ".clone"
 
@@ -82,7 +84,9 @@ TOOL_DEFS = [
             "description": "Записать или обновить SUMMARY.md — файл с общим описанием "
                            "проекта. Вызывай после того, как изучил код и архитектуру "
                            "через терминал, чтобы сохранить понимание проекта для "
-                           "последующих запусков. Пиши на русском языке.",
+                           "последующих запусков. Передавай содержимое напрямую "
+                           "в параметре content — не пиши во временные файлы. "
+                           "Пиши на русском языке.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -158,9 +162,11 @@ class DocAgent:
     """Агент управления документацией."""
 
     def __init__(self, state: ProjectState, verbose: bool = False,
-                 log: bool = False) -> None:
+                 log: bool = False, log_file: Optional[str] = None) -> None:
         self.state = state
         self.verbose = verbose
+        self._log_enabled = log
+        self._log_file_path = log_file
 
 
         # Рабочая директория — там, где лежит .docgen.yaml
@@ -171,9 +177,10 @@ class DocAgent:
         # LLM-клиент
         cfg = state.config
         self._generator: Optional[DocGenerator] = None
-        if cfg.llm_api_key:
+        api_key = cfg.llm_api_key or os.environ.get("OPENAI_API_KEY")
+        if api_key:
             self._generator = DocGenerator(
-                api_key=cfg.llm_api_key,
+                api_key=api_key,
                 model=cfg.llm_model,
                 base_url=cfg.llm_base_url,
             )
@@ -235,6 +242,7 @@ class DocAgent:
                 self.state.config.git_repo, self._clone_dir, self._token,
                 verbose=self.verbose,
             )
+            fetch_tags(self._clone_dir, self._token)
             latest = get_latest_tag(
                 self._clone_dir,
                 github_token=self._token,
@@ -262,7 +270,7 @@ class DocAgent:
             self._log(f"\n  [agent] ▶ Создание снэпшота на {label} → {commit_hash[:8]}")
 
         md_files = scan_md_files(self._clone_dir, treeish=commit_hash)
-        dir_name = ref if ref else commit_hash
+        dir_name = sanitize_tag_name(ref) if ref else commit_hash
         snapshot_dir = os.path.join(self._work_dir, dir_name)
 
         # Копируем все .md
@@ -302,6 +310,7 @@ class DocAgent:
             if self.verbose:
                 self._log(f"\n  [agent] ▶ Полный аудит документации (до {n_audit} ходов)")
             audit = self._full_audit(snapshot_dir, ref=commit_hash, max_turns=n_audit)
+            audit.release_tag = ref
             result = audit
         elif check and not self._generator:
             if self.verbose:
@@ -344,7 +353,7 @@ class DocAgent:
 
             if self.verbose:
                 now = datetime.now().strftime("%H:%M:%S")
-                self._log(f"\n  [agent] 💤 Сон {interval} мин ({now})")
+                self._log(f"\n  [agent] 💤 Сон {interval} мин")
             time.sleep(interval * 60)
 
     # ── Внутренние методы ────────────────────────────────
@@ -355,6 +364,7 @@ class DocAgent:
             self._log(f"  [agent]   ⏳ Fetch тегов {self.state.config.git_repo}...")
             t0 = time.monotonic()
         fetch_repo(self._clone_dir, self._token)
+        fetch_tags(self._clone_dir, self._token)
         if self.verbose:
             self._log(f"  [agent]   ✅ Fetch готов ({time.monotonic() - t0:.1f}с)")
 
@@ -393,8 +403,8 @@ class DocAgent:
         if self.verbose:
             self._log(f"  [agent]   Новый релиз: {old_tag} → {latest_tag}")
 
-        old_snapshot_dir = os.path.join(self._work_dir, old_tag)
-        new_snapshot_dir = os.path.join(self._work_dir, latest_tag)
+        old_snapshot_dir = os.path.join(self._work_dir, sanitize_tag_name(old_tag))
+        new_snapshot_dir = os.path.join(self._work_dir, sanitize_tag_name(latest_tag))
 
         if not os.path.isdir(old_snapshot_dir):
             if self.verbose:
@@ -1602,21 +1612,27 @@ class DocAgent:
     def _log(self, msg: str) -> None:
         """Вывести в консоль (+ в лог-файл, если включено)."""
         if self.verbose:
-            print(msg)
+            print(msg, flush=True)
         if self._log_enabled and self._log_file:
             clean = re.sub(r'\x1b\[[0-9;]*m', '', msg)
             now = datetime.now().strftime("%H:%M:%S")
-            self._log_file.write(f"[{now}] {clean}\n")
+            # Убираем leading \n — оно нужно для консольного форматирования,
+            # но в файл создаёт лишний перенос после [время]
+            self._log_file.write(f"[{now}] {clean.lstrip(chr(10))}\n")
             self._log_file.flush()
 
     def _log_open(self, name: str) -> None:
         """Открыть лог-файл для команды."""
         if not self._log_enabled:
             return
-        log_dir = Path(self._work_dir) / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_path = log_dir / f"{name}_{stamp}.log"
+        if self._log_file_path:
+            log_path = Path(self._log_file_path)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            log_dir = Path(self._work_dir) / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_path = log_dir / f"{name}_{stamp}.log"
         self._log_file = open(log_path, "w", encoding="utf-8")
         self._log(f"  [agent] ▶ Лог открыт: {log_path}")
 

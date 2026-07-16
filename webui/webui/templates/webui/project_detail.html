@@ -1,0 +1,123 @@
+{% extends "webui/base.html" %}
+{% block title %}{{ project.name }} · Docgen{% endblock %}
+{% block content %}
+<a class="back" href="{% url 'dashboard' %}">← Все проекты</a>
+<div class="page-heading">
+  <div>
+    <p class="eyebrow">{{ project.slug }}</p>
+    <h1>{{ project.name }}</h1>
+    <p class="repo">{{ project.repository_url }}</p>
+  </div>
+  <div class="actions"
+    hx-get="{% url 'project-actions-partial' project.slug %}"
+    hx-trigger="every 10s"
+    hx-swap="outerHTML">
+    {% if init_status == "failed" %}
+      <form method="post" action="{% url 'reinit-project' project.slug %}"
+        onsubmit="return confirm('Инициализация проекта не удалась — запустить повторную?')">
+        {% csrf_token %}<button class="button secondary">Переинициализировать</button>
+      </form>
+    {% endif %}
+    <a class="button" href="{% url 'project-update' project.slug %}">Настройки</a>
+    <span class="status {{ init_status }}">{{ init_label }}</span>
+  </div>
+</div>
+
+<div class="split">
+  <section class="card form-card">
+    <h2>Создать snapshot</h2>
+    <form method="post" action="{% url 'snapshot-create' project.slug %}" class="stack">
+      {% csrf_token %}
+      <p>
+        <label for="release">Тег релиза <span class="muted">(пусто = последний релиз)</span></label>
+        <input id="release" name="release" placeholder="v1.0.0 или release-2026-07">
+      </p>
+      <label class="check"><input type="checkbox" name="check"> Выполнить полный LLM-аудит</label>
+      <button class="button primary" {% if init_status != "succeeded" %}disabled{% endif %}>
+        Поставить в очередь
+      </button>
+    </form>
+
+    <hr class="section-divider">
+    <h2>Режим наблюдения</h2>
+    <div style="display:flex;gap:8px">
+      <form method="post" action="{% url 'watch-create' project.slug %}" style="flex:1">
+        {% csrf_token %}
+        <button class="button primary"
+          style="width:100%;justify-content:center"
+          {% if init_status != "succeeded" or watch_active %}disabled{% endif %}>
+          {% if watch_active %}Наблюдение запущено{% else %}Запустить режим наблюдения{% endif %}
+        </button>
+      </form>
+      {% if watch_active %}
+        <a href="{% url 'watch-monitor' project.slug %}" class="button"
+          style="font-size:16px;display:inline-flex;align-items:center;justify-content:center;min-width:42px"
+          title="Открыть монитор наблюдения">👁</a>
+        <form method="post" action="{% url 'watch-stop' project.slug %}"
+          style="margin:0;padding:0"
+          onsubmit="return confirm('Остановить наблюдение?')">
+          {% csrf_token %}
+          <button class="button danger" title="Остановить наблюдение"
+            style="font-size:16px;display:inline-flex;align-items:center;justify-content:center;min-width:42px">⏹</button>
+        </form>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="card facts">
+    <h2>Настройки</h2>
+    <dl>
+      <dt>Ветка</dt><dd>{{ project.default_branch }}</dd>
+      <dt>Модель</dt><dd>{{ project.llm_model }}</dd>
+      <dt>Base URL</dt><dd>{{ project.llm_base_url|default:"OpenAI" }}</dd>
+      <dt>API-ключ</dt><dd>{% if project.has_llm_api_key %}Сохранён{% else %}Не задан{% endif %}</dd>
+      <dt>GitHub-токен</dt><dd>{% if project.has_github_token %}Сохранён{% else %}Не задан{% endif %}</dd>
+      <dt>Рабочий каталог</dt><dd><code>{{ project.workspace_path }}</code></dd>
+    </dl>
+  </section>
+</div>
+
+<section class="section">
+  <h2>Версии документации</h2>
+  <div class="card table-wrap">
+    <table>
+      <thead><tr><th>Релиз</th><th>Коммит</th><th>Документов</th><th>Обнаружено</th></tr></thead>
+      <tbody>
+        {% for version in versions %}
+          <tr>
+            <td><a class="mono" href="{% url 'version-detail' project.slug version.pk %}">{{ version.label }}</a></td>
+            <td class="mono">{{ version.commit_hash|slice:":12" }}</td>
+            <td>{{ version.documents_count }}</td>
+            <td>{{ version.created_at|date:"d.m.Y H:i" }}</td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="4">Снимков ещё нет.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="section">
+  <h2>Задания</h2>
+  <div class="card table-wrap">
+    <table>
+      <thead><tr><th>ID</th><th>Операция</th><th>Статус</th><th>Время</th></tr></thead>
+      <tbody>
+        {% for job in jobs %}
+          {% if job.kind != "watch" %}
+            <tr>
+              <td><a href="{% url 'job-detail' job.pk %}">#{{ job.pk }}</a></td>
+              <td>{{ job.get_kind_display }}</td>
+              <td><span class="status {{ job.status }}">{{ job.get_status_display }}</span></td>
+              <td>{{ job.created_at|date:"d.m.Y H:i" }}</td>
+            </tr>
+          {% endif %}
+        {% empty %}
+          <tr><td colspan="4">Заданий пока нет.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

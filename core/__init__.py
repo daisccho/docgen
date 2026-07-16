@@ -6,6 +6,6 @@
 
 from __future__ import annotations
 
-from docgen.models import ReleaseMap
+from core.models import ReleaseMap
 
 __version__ = "0.0.1"

@@ -1,0 +1,6 @@
+{% extends "webui/base.html" %}
+{% block title %}{% if editing %}Настройки {{ project.name }}{% else %}Новый проект{% endif %} · Docgen{% endblock %}
+{% block content %}
+<div class="narrow"><a class="back" href="{% if editing %}{{ project.get_absolute_url }}{% else %}{% url 'dashboard' %}{% endif %}">← {% if editing %}{{ project.name }}{% else %}Все проекты{% endif %}</a><p class="eyebrow">{% if editing %}PROJECT SETTINGS{% else %}NEW PROJECT{% endif %}</p><h1>{% if editing %}Настройки проекта{% else %}Подключить репозиторий{% endif %}</h1>
+<div class="card form-card"><form method="post" class="stack">{% csrf_token %}{{ form.as_p }}<div class="actions"><a class="button" href="{% if editing %}{{ project.get_absolute_url }}{% else %}{% url 'dashboard' %}{% endif %}">Отмена</a><button class="button primary" type="submit">{% if editing %}Сохранить настройки{% else %}Создать и инициализировать{% endif %}</button></div></form></div></div>
+{% endblock %}

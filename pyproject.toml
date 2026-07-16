@@ -12,6 +12,8 @@ requires-python = ">=3.11"
 
 dependencies = [
     "click>=8.1",
+    "cryptography>=42.0",
+    "django>=5.1,<6.0",
     "gitpython>=3.1",
     "openai>=1.0",
     "pydantic>=2.0",
@@ -19,9 +21,18 @@ dependencies = [
     "requests>=2.28",
 ]
 
+[tool.setuptools.package-data]
+"webui.webui" = ["templates/**/*.html", "static/**/*"]
+
 [project.scripts]
-docgen = "docgen.main:cli"
+docgen = "core.main:cli"
 
 [tool.setuptools]
-packages = ["docgen"]
-package-dir = {docgen = "."}
+packages = [
+    "core",
+    "webui",
+    "webui.webui",
+    "webui.webui.management",
+    "webui.webui.management.commands",
+]
+package-dir = {"core" = "core", "webui" = "webui"}

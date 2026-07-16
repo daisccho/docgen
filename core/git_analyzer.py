@@ -13,8 +13,8 @@ import git
 import requests
 from git import Repo
 
-from docgen.errors import DocAgentError, NotGitRepositoryError, RefNotFoundError
-from docgen.models import ChangeType, CommitInfo, FileChange
+from core.errors import DocAgentError, NotGitRepositoryError, RefNotFoundError
+from core.models import ChangeType, CommitInfo, FileChange
 
 # ── Вспомогательные функции ────────────────────────────────
 
@@ -153,6 +153,7 @@ def ensure_clone(
             def normalize_url(url: str) -> str:
                 # Убираем протокол, токен, .git
                 url = re.sub(r'^https?://[^@]+@', '', url)
+                url = re.sub(r'^https?://', '', url)
                 url = re.sub(r'\.git$', '', url)
                 url = re.sub(r'^git@', '', url)
                 url = re.sub(r'^ssh://', '', url)
@@ -460,7 +461,11 @@ def get_snapshot_versions(work_dir: str) -> list[dict]:
     root = Path(work_dir)
     versions: list[dict] = []
     for entry in root.iterdir():
-        if entry.is_dir() and not entry.name.startswith("."):
+        if (
+            entry.is_dir()
+            and not entry.name.startswith(".")
+            and entry.name not in {"logs", "workspaces", "staticfiles"}
+        ):
             versions.append({"name": entry.name, "dir": str(entry)})
     versions.sort(key=lambda v: v["name"], reverse=True)
     return versions

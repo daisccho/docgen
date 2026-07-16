@@ -158,6 +158,10 @@ activemq-data/
 .release-map.yaml
 .clone/
 
+# docgen-webui
+workspaces/
+staticfiles/
+
 # Environments
 .venv
 env/

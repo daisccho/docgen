@@ -9,8 +9,8 @@ from typing import Optional
 
 import click
 
-from docgen.agent import DocAgent
-from docgen.config import (
+from core.agent import DocAgent
+from core.config import (
     find_project_root,
     init_project,
     load_release_map,
@@ -18,8 +18,8 @@ from docgen.config import (
     save_release_map,
     save_state,
 )
-from docgen.errors import DocAgentError
-from docgen.git_analyzer import (
+from core.errors import DocAgentError
+from core.git_analyzer import (
     fetch_tags,
     get_all_tags_with_hash,
     get_latest_tag,
@@ -27,7 +27,20 @@ from docgen.git_analyzer import (
     get_tag_commit_hash,
     sanitize_tag_name,
 )
-from docgen.models import ProjectState, ReleaseMap
+from core.models import ProjectState, ReleaseMap
+
+
+def _configure_console_encoding() -> None:
+    """Prevent Unicode UI symbols from crashing the CLI on Windows."""
+    if os.name != "nt":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
+_configure_console_encoding()
 
 
 def _require_state() -> ProjectState:
@@ -85,9 +98,11 @@ def cli(ctx: click.Context, verbose: bool) -> None:
 @click.option("--project", default="default", help="Имя проекта")
 @click.option("--iterations", "-i", default=None, type=int,
               help="Максимум ходов (по умолч. 10)")
+@click.option("--provider", default=None,
+              help="Провайдер LLM (openai, anthropic, openrouter)")
 def init(repo: str, github_token_env: Optional[str], api_key: Optional[str],
          base_url: Optional[str], model: str, project: str,
-         iterations: Optional[int]) -> None:
+         iterations: Optional[int], provider: Optional[str]) -> None:
     """Инициализировать проект docgen в текущей папке.
 
     Создаёт .docgen.yaml, .release-map.yaml и клонирует репозиторий в .clone/.
@@ -108,6 +123,7 @@ def init(repo: str, github_token_env: Optional[str], api_key: Optional[str],
         github_token_env=github_token_env,
         project_name=project,
         max_turns=iterations,
+        llm_provider=provider,
     )
 
     # Создаём пустой release map
@@ -191,10 +207,12 @@ def snapshot(ctx: click.Context, release: Optional[str],
 @click.option("--iterations", "-i", default=None, type=int,
               help="Максимум ходов (вызовов terminal) на один .md")
 @click.option("--log", "-l", is_flag=True, help="Логировать в logs/")
+@click.option("--log-file", help="Путь к файлу лога (заменяет --log)")
 @click.option("--verbose", "-v", is_flag=True, help="Подробный вывод")
 @click.pass_context
 def watch(ctx: click.Context, interval: int,
           iterations: Optional[int], log: bool,
+          log_file: Optional[str],
           verbose: bool) -> None:
     """Запустить демон автообновления документации по релизам.
 
@@ -213,7 +231,8 @@ def watch(ctx: click.Context, interval: int,
     click.echo()
 
     try:
-        agent = DocAgent(state, verbose=verbose, log=log)
+        agent = DocAgent(state, verbose=verbose, log=bool(log_file or log),
+                         log_file=log_file)
         if iterations is not None:
             agent._max_turns = iterations
         agent.watch(interval=interval)
@@ -247,8 +266,9 @@ def versions() -> None:
 
     release_map = load_release_map()
     current = release_map.last_documented_release
+    current_dir = sanitize_tag_name(current) if current else None
     click.echo(f"Версии ({len(snaps)}):")
     for s in snaps:
-        marker = " ★" if s["name"] == current else ""
+        marker = " ★" if s["name"] == current_dir else ""
         click.echo(f"  {s['name']}{marker}")
     click.echo()

@@ -1,0 +1,3 @@
+{% extends "webui/base.html" %}
+{% block title %}{{ version.label }} · {{ project.name }}{% endblock %}
+{% block content %}<a class="back" href="{{ project.get_absolute_url }}">← {{ project.name }}</a><p class="eyebrow">DOCUMENTATION RELEASE</p><h1 class="mono">{{ version.label }}</h1><p class="muted">Коммит {{ version.commit_hash|slice:":12" }} · {{ version.documents_count }} Markdown-документов</p><div class="card document-list">{% for document in documents %}<a href="{% url 'document-detail' project.slug version.pk document %}"><span>▤</span>{{ document }}</a>{% empty %}<p>Документов нет.</p>{% endfor %}</div>{% endblock %}

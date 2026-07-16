@@ -1,0 +1,3 @@
+{% extends "webui/base.html" %}
+{% block title %}{{ document_path }} · Docgen{% endblock %}
+{% block content %}<a class="back" href="{% url 'version-detail' project.slug version.pk %}">← Релиз {{ version.label }}</a><p class="eyebrow">MARKDOWN</p><h1>{{ document_path }}</h1><div class="card"><pre class="document-source">{{ content }}</pre></div>{% endblock %}
