@@ -1,4 +1,4 @@
-"""CLI docgen — init, snapshot, watch, versions."""
+"""CLI docgen — init, snapshot, watch, versions, tui."""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ from docgen.git_analyzer import (
     sanitize_tag_name,
 )
 from docgen.models import ProjectState, ReleaseMap
+from docgen.tui.commands.tui import tui as tui_cmd
 
 
 def _require_state() -> ProjectState:
@@ -70,6 +71,10 @@ def cli(ctx: click.Context, verbose: bool) -> None:
     """docgen — автономная поддержка документации через ИИ-агент."""
     ctx.ensure_object(dict)
     ctx.obj["verbose"] = verbose
+
+
+# ── tui ──────────────────────────────────────────────
+cli.add_command(tui_cmd)
 
 
 # ── init ──────────────────────────────────────────────
@@ -131,6 +136,7 @@ def init(repo: str, github_token_env: Optional[str], api_key: Optional[str],
     click.echo("  docgen snapshot -c        — снэпшот + проверка актуальности")
     click.echo("  docgen watch -t 5         — следить за новыми релизами каждые 5 мин")
     click.echo("  docgen versions           — список версий")
+    click.echo("  docgen tui                — TUI-интерфейс")
 
 
 # ── snapshot ──────────────────────────────────────

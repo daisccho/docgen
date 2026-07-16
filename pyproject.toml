@@ -23,5 +23,5 @@ dependencies = [
 docgen = "docgen.main:cli"
 
 [tool.setuptools]
-packages = ["docgen"]
-package-dir = {docgen = "."}
+packages = ["docgen", "docgen.tui", "docgen.tui.screens", "docgen.tui.widgets", "docgen.tui.commands"]
+package-dir = {"docgen" = "."}
