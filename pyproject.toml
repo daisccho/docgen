@@ -4,9 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "docgen"
-version = "0.0.1"
+version = "0.0.2"
 description = "Инструмент с встроенным ИИ-агентом, предназначенный для автоматического поддержания документации программного продукта на основе анализа git-репозитория."
-authors = [{name = "daisccho"}]
+authors = [
+	{name = "daisccho"},
+	{name = "Master-20"}
+]
 readme = "README.md"
 requires-python = ">=3.11"
 
