@@ -31,7 +31,7 @@ pip install -e .
 mkdir project
 docgen init --repo https://github.com/user/example.git
 ```
-В папке появятся два файла: .docgen.yaml и .release-map.yaml. Залезаем в .docgen.yaml и меняем его на свой вкус. Структуру можно посмотреть [ниже](###.docgen.yaml).
+В папке появятся два файла: .docgen.yaml и .release-map.yaml. Залезаем в .docgen.yaml и меняем его на свой вкус. Структуру можно посмотреть [ниже](####docgenyaml).
 
 # Доступные команды
 - **docgen init [OPTIONS]**  
