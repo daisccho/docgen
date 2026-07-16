@@ -4,7 +4,7 @@
 
 # Использование
 > [!IMPORTANT]
-> Пока что доступно только для Linux.
+> Доступно два режима: веб-интерфейс и CLI-инструмент. TUI для CLI пока что находится в разработке.
 
 Клонируем репозиторий и переходим в него:
 ```bash
@@ -24,6 +24,14 @@ pip install -e .
 > [!NOTE]
 > `pip install -e .` устанавливает команду `docgen` глобально — можно вызывать из любого места.
 > Обновиться до новой версии можно комбинацией команд `git pull` и `pip install -e .`.
+
+## CLI
+Отдельно создаем папку для анализируемого проекта и инициализируем docgen:
+```bash
+mkdir project
+docgen init --repo https://github.com/user/example.git
+```
+В папке появятся два файла: .docgen.yaml и .release-map.yaml. Залезаем в .docgen.yaml и меняем его на свой вкус. Структуру можно посмотреть [ниже](###.docgen.yaml).
 
 # Доступные команды
 - **docgen init [OPTIONS]**  
@@ -75,14 +83,14 @@ pip install -e .
 После запуска команды **docgen init** в cwd создается файл **.docgen.yaml**, который имеющий следующую структуру:
 ```yaml
 config:
-  git_repo: https://github.com/blank/repo
+  git_repo: https://github.com/blank/repo # ссылка на репозиторий
   github_token_env: GITHUB_TOKEN  # переменная окружения с GitHub-токеном (опционально)
-  llm_provider: openai
-  llm_model: gpt-4o
+  llm_provider: openai # название провайдера, пока не используется
+  llm_model: gpt-4o # название модели, указывать в соответствии с документацией провайдера
   llm_api_key: null  # или OPENAI_API_KEY в env
   llm_base_url: null # для OpenAI-совместимых провайдеров
-  project_name: default  # имя проекта
-  max_turns: 10
+  project_name: default  # имя проекта, пока не используется
+  max_turns: 10 # максимальное количество шагов, доступное агенту на время исполнения задачи
 ```
 
 ### .release-map.yaml
