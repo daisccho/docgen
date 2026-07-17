@@ -5,7 +5,7 @@ from .models import DocumentVersion, GlobalSettings, Job, Project
 
 @admin.register(Project)
 class ProjectAdmin(admin.ModelAdmin):
-    list_display = ("name", "repository_url", "default_branch", "updated_at")
+    list_display = ("name", "repository_url", "updated_at")
     search_fields = ("name", "slug", "repository_url")
 
 

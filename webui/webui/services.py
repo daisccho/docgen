@@ -178,8 +178,6 @@ def build_command(job: Job) -> list[str]:
             "init",
             "--repo",
             project.repository_url,
-            "--branch",
-            project.default_branch,
             "--model",
             common.llm_model,
             "--project",
@@ -214,8 +212,6 @@ def build_command(job: Job) -> list[str]:
             "-v",
             "-t",
             str(job.project.watch_interval),
-            "--branch",
-            job.project.default_branch,
         ]
         if job.log_path:
             command += ["--log-file", job.log_path]
@@ -265,7 +261,6 @@ def sync_project_runtime_config(project: Project) -> None:
     common = GlobalSettings.load()
     base_url = common.llm_base_url or project.llm_base_url
     has_github_token = common.has_github_token or project.has_github_token
-    config["git_branch"] = project.default_branch
     config["llm_model"] = common.llm_model
     config["llm_provider"] = "openai"
     config["llm_base_url"] = base_url or None

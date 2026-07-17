@@ -9,7 +9,6 @@ class ProjectForm(forms.ModelForm):
         fields = [
             "name",
             "repository_url",
-            "default_branch",
             "watch_interval",
         ]
         widgets = {

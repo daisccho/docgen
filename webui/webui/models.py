@@ -20,7 +20,6 @@ class Project(models.Model):
         "Идентификатор", unique=True, blank=True, validators=[slug_validator]
     )
     repository_url = models.CharField("Git-репозиторий", max_length=500)
-    default_branch = models.CharField("Основная ветка", max_length=120, default="main")
     llm_model = models.CharField("LLM-модель", max_length=120, default="gpt-4o")
     llm_base_url = models.URLField("Base URL LLM", max_length=500, blank=True)
     api_key_env = models.CharField(
@@ -227,6 +226,10 @@ class Job(models.Model):
     def error_hint(self) -> str:
         text = f"{self.error}\n{self.output}".lower()
         hints = [
+            (
+                ("отсутствуют релизные теги", "релизный тег не найден"),
+                "Создайте релизный Git-тег в репозитории или укажите существующий тег.",
+            ),
             (
                 ("401", "unauthorized", "invalid api key"),
                 "Проверьте API-ключ в общих настройках и доступ ключа к выбранной модели.",

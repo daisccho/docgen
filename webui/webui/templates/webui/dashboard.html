@@ -8,20 +8,19 @@
 
 <section class="card table-wrap">
   <table class="projects-table">
-    <thead><tr><th>Проект</th><th>Идентификатор</th><th>Репозиторий</th><th>Ветка</th><th>Интервал watch</th><th>Версии</th><th>Задания</th></tr></thead>
+    <thead><tr><th>Проект</th><th>Идентификатор</th><th>Репозиторий</th><th>Интервал watch</th><th>Версии</th><th>Задания</th></tr></thead>
     <tbody>
   {% for project in projects %}
     <tr>
       <td><a href="{{ project.get_absolute_url }}"><strong>{{ project.name }}</strong></a></td>
       <td><code>{{ project.slug }}</code></td>
       <td class="repo">{{ project.repository_url }}</td>
-      <td><span class="badge">{{ project.default_branch }}</span></td>
       <td>{{ project.watch_interval }} мин</td>
       <td>{{ project.versions.count }}</td>
       <td>{{ project.jobs.count }}</td>
     </tr>
   {% empty %}
-    <tr><td colspan="7"><div class="empty"><h2>Пока нет проектов</h2><p>Добавьте Git-репозиторий, чтобы создать первое задание.</p></div></td></tr>
+    <tr><td colspan="6"><div class="empty"><h2>Пока нет проектов</h2><p>Добавьте Git-репозиторий, чтобы создать первое задание.</p></div></td></tr>
   {% endfor %}
     </tbody>
   </table>

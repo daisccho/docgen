@@ -10,6 +10,7 @@ from django.urls import reverse
 
 from core.agent import DocAgent
 from core.config import init_project
+from core.errors import DocAgentError, RefNotFoundError
 from core.git_analyzer import get_snapshot_versions
 from .models import GlobalSettings, Job, Project
 from .services import (
@@ -53,12 +54,12 @@ class WebuiTests(TestCase):
         for field in (
             "name",
             "repository_url",
-            "default_branch",
             "watch_interval",
         ):
             self.assertContains(response, f'name="{field}"')
         for field in (
             "slug",
+            "default_branch",
             "llm_model",
             "llm_base_url",
             "max_iterations",
@@ -78,13 +79,11 @@ class WebuiTests(TestCase):
             {
                 "name": "Other",
                 "repository_url": "https://example.org/other.git",
-                "default_branch": "develop",
                 "watch_interval": 15,
             },
         )
         self.assertRedirects(response, reverse("project-detail", args=["other"]))
         project = Project.objects.get(slug="other")
-        self.assertEqual(project.default_branch, "develop")
         self.assertEqual(project.watch_interval, 15)
         self.assertTrue(
             Job.objects.filter(
@@ -164,8 +163,7 @@ class WebuiTests(TestCase):
         command = build_command(job)
         self.assertEqual(command[1:3], ["-m", "core"])
         self.assertIn("--repo", command)
-        self.assertIn("--branch", command)
-        self.assertIn(self.project.default_branch, command)
+        self.assertNotIn("--branch", command)
         self.assertIn("deepseek-v4-flash-free", command)
         self.assertIn("23", command)
         self.assertIn("https://opencode.ai/zen/v1", command)
@@ -261,8 +259,48 @@ class WebuiTests(TestCase):
         command = build_command(job)
         self.assertIn("watch", command)
         self.assertIn("27", command)
-        self.assertIn("--branch", command)
-        self.assertIn(self.project.default_branch, command)
+        self.assertNotIn("--branch", command)
+
+    def test_snapshot_stops_when_repository_has_no_release_tags(self):
+        with TemporaryDirectory() as root:
+            previous = os.getcwd()
+            try:
+                os.chdir(root)
+                state = init_project("https://example.org/repo.git")
+                agent = DocAgent(state)
+                with (
+                    patch("core.agent.ensure_clone"),
+                    patch("core.agent.fetch_tags"),
+                    patch("core.agent.get_latest_tag", return_value=None),
+                ):
+                    with self.assertRaisesRegex(
+                        DocAgentError, "отсутствуют релизные теги"
+                    ):
+                        agent.snapshot()
+            finally:
+                os.chdir(previous)
+
+    def test_snapshot_rejects_branch_instead_of_release_tag(self):
+        with TemporaryDirectory() as root:
+            previous = os.getcwd()
+            try:
+                os.chdir(root)
+                state = init_project("https://example.org/repo.git")
+                agent = DocAgent(state)
+                with (
+                    patch("core.agent.ensure_clone"),
+                    patch("core.agent.fetch_tags"),
+                    patch(
+                        "core.agent.get_all_tags_with_hash",
+                        return_value={"v1.0.0": "a" * 40},
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        RefNotFoundError, "Релизный тег не найден"
+                    ):
+                        agent.snapshot(release_tag="main")
+            finally:
+                os.chdir(previous)
 
     def test_document_path_cannot_escape_snapshot(self):
         with TemporaryDirectory() as root:

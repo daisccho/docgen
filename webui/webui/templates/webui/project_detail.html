@@ -32,6 +32,7 @@
         <label for="release">Тег релиза <span class="muted">(пусто = последний релиз)</span></label>
         <input id="release" name="release" placeholder="v1.0.0 или release-2026-07">
       </p>
+      <p class="muted">Docgen работает только с релизными Git-тегами. Если тегов нет, snapshot не создаётся.</p>
       <label class="check"><input type="checkbox" name="check"> Выполнить полный LLM-аудит</label>
       <button class="button primary" {% if init_status != "succeeded" %}disabled{% endif %}>
         Поставить в очередь
@@ -68,7 +69,6 @@
     <h2>Настройки</h2>
     <dl>
       <dt>ID</dt><dd><code>{{ project.slug }}</code></dd>
-      <dt>Ветка</dt><dd>{{ project.default_branch }}</dd>
       <dt>Watch</dt><dd>{{ project.watch_interval }} мин</dd>
       <dt>Модель</dt><dd>{{ common.llm_model }}</dd>
       <dt>Base URL</dt><dd>{{ common.llm_base_url|default:"OpenAI" }}</dd>

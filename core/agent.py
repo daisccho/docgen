@@ -19,8 +19,8 @@ from core.config import (
     save_state,
 )
 from core.doc_generator import DocGenerator
+from core.errors import DocAgentError, RefNotFoundError
 from core.git_analyzer import (
-    clone_repo,
     ensure_clone,
     ensure_ref_available,
     extract_file_from_repo,
@@ -28,6 +28,7 @@ from core.git_analyzer import (
     fetch_tags,
     get_deleted_md_files,
     get_diff_files,
+    get_all_tags_with_hash,
     get_head_hash,
     get_latest_tag,
     get_new_md_files,
@@ -217,8 +218,8 @@ class DocAgent:
     ) -> GenerationResult:
         """Создать снэпшот документации.
 
-        Без release_tag — на текущем HEAD. С release_tag — на указанном теге, хэше
-        или ветке (например v1.0, abc1234, main).
+        Без release_tag — на последнем релизном теге. С release_tag — строго на
+        указанном теге (например v1.0.0). Ветки и SHA не поддерживаются.
 
         Копирует все .md-файлы из репозитория в <work_dir>/<hash>/.
         Если check=True, дополнительно запускает аудит.
@@ -232,21 +233,28 @@ class DocAgent:
             t0 = time.monotonic()
 
         if ref:
-            # Фиксированный ref: не фетчим, если уже есть локально
+            # Явно указанное значение должно быть именно Git-тегом.
             ensure_clone(
                 self.state.config.git_repo, self._clone_dir, self._token,
                 verbose=self.verbose,
             )
+            fetch_tags(self._clone_dir, self._token)
+            tags = get_all_tags_with_hash(self._clone_dir)
+            if ref not in tags:
+                raise RefNotFoundError(
+                    f"Релизный тег не найден: {ref}. "
+                    "Ветки и SHA-коммиты не поддерживаются."
+                )
             if self.verbose:
                 self._log(f"  [agent]   ✅ Клон готов ({time.monotonic() - t0:.1f}с)")
             if self.verbose:
                 self._log(f"  [agent]   🔍 Поиск тега {ref}...")
                 t0 = time.monotonic()
-            commit_hash = ensure_ref_available(self._clone_dir, ref)
+            commit_hash = tags[ref]
             if self.verbose:
                 self._log(f"  [agent]   ✅ Тег найден ({time.monotonic() - t0:.1f}с)")
         else:
-            # Без ref — ищем последний релиз через GitHub API, иначе HEAD
+            # Без ref — ищем последний релиз через GitHub API или Git-теги.
             ensure_clone(
                 self.state.config.git_repo, self._clone_dir, self._token,
                 verbose=self.verbose,
@@ -257,27 +265,18 @@ class DocAgent:
                 github_token=self._token,
                 repo_url=self.state.config.git_repo,
             )
-            if latest:
-                ref = latest
-                if self.verbose:
-                    self._log(f"  [agent]   🔍 Последний релиз: {ref}")
-                    t0 = time.monotonic()
-                commit_hash = ensure_ref_available(self._clone_dir, ref)
-                if self.verbose:
-                    self._log(f"  [agent]   ✅ Ref найден ({time.monotonic() - t0:.1f}с)")
-            else:
-                if self.verbose:
-                    self._log(
-                        "  [agent]   ⏳ Релизов нет — используем ветку "
-                        f"{self.state.config.git_branch}..."
-                    )
-                    t0 = time.monotonic()
-                clone_repo(self.state.config.git_repo, self._clone_dir, self._token)
-                if self.verbose:
-                    self._log(f"  [agent]   ✅ Клон готов ({time.monotonic() - t0:.1f}с)")
-                commit_hash = ensure_ref_available(
-                    self._clone_dir, self.state.config.git_branch
+            if not latest:
+                raise DocAgentError(
+                    "В репозитории отсутствуют релизные теги. "
+                    "Создание snapshot остановлено."
                 )
+            ref = latest
+            if self.verbose:
+                self._log(f"  [agent]   🔍 Последний релиз: {ref}")
+                t0 = time.monotonic()
+            commit_hash = ensure_ref_available(self._clone_dir, ref)
+            if self.verbose:
+                self._log(f"  [agent]   ✅ Ref найден ({time.monotonic() - t0:.1f}с)")
 
         if self.verbose:
             label = ref or "HEAD"
