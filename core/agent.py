@@ -122,21 +122,29 @@ TOOL_DEFS = [
         "function": {
             "name": "submit_changelog_entry",
             "description": "Добавить новую запись в CHANGELOG.md. "
-                           "Запись будет дописана в конец файла. "
-                           "Предыдущие записи не изменятся. "
+                           "Заголовок записи сформируется автоматически. "
                            "Не нужно читать старый CHANGELOG — просто вызови "
-                           "этот инструмент с текстом новой записи.",
+                           "этот инструмент с текстом записи (без заголовка). "
+                           "Если запись для этой пары версий уже существует — "
+                           "вернёт ошибку.",
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "from_ref": {
+                        "type": "string",
+                        "description": "Старый тег (от которого, напр. v0.80.2)",
+                    },
+                    "to_ref": {
+                        "type": "string",
+                        "description": "Новый тег (до которого, напр. v0.80.10)",
+                    },
                     "content": {
                         "type": "string",
                         "description": "Текст новой записи для CHANGELOG.md. "
-                                       "Только новая запись, без заголовка # CHANGELOG "
-                                       "и без старых записей.",
+                                       "Только тело записи, без заголовка ## [...].",
                     },
                 },
-                "required": ["content"],
+                "required": ["from_ref", "to_ref", "content"],
             },
         },
     },
@@ -439,6 +447,9 @@ class DocAgent:
         developer_md_files = [
             f for f in dev_md_proc.stdout.strip().split("\n") if f
         ] if dev_md_proc.returncode == 0 else []
+        # Исключаем служебные файлы из списка изменённых разработчиками
+        _skip_md_files = {"SUMMARY.md", "CHANGELOG.md", "SAMPLE.md", "SAMPLES.md"}
+        developer_md_files = [f for f in developer_md_files if f not in _skip_md_files]
 
         self._ensure_changelog(
             old_tag, latest_tag,
@@ -1182,13 +1193,37 @@ class DocAgent:
                 elif tc.function.name == "submit_changelog_entry":
                     try:
                         args = json.loads(tc.function.arguments)
+                        from_ref = args.get("from_ref", "")
+                        to_ref = args.get("to_ref", "")
                         content = args.get("content", "")
+                        if not from_ref or not to_ref:
+                            result = "[ERROR: from_ref и to_ref обязательны]"
+                            break
+
+                        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        header_line = f"## [{now_str}] {from_ref} -> {to_ref}"
+
+                        # Проверка на дубликаты
+                        if os.path.isfile(self._changelog_path):
+                            with open(self._changelog_path, encoding="utf-8") as f:
+                                existing = f.read()
+                            marker = f"{from_ref} -> {to_ref}"
+                            if marker in existing:
+                                result = (
+                                    f"[ERROR: запись для {marker} уже существует в "
+                                    f"CHANGELOG.md. Новая запись не добавлена.]"
+                                )
+                                break
+
+                        # Формируем полную запись
+                        entry = f"\n{header_line}\n\n{content.strip()}\n"
+
                         header = "# CHANGELOG документации\n\n"
                         if not os.path.isfile(self._changelog_path):
                             with open(self._changelog_path, "w", encoding="utf-8") as f:
                                 f.write(header)
                         with open(self._changelog_path, "a", encoding="utf-8") as f:
-                            f.write("\n" + content.strip() + "\n")
+                            f.write(entry)
                         result = f"Запись добавлена в CHANGELOG.md ({len(content)} символов)."
                     except (json.JSONDecodeError, KeyError) as exc:
                         result = f"[ERROR: невалидные аргументы: {exc}]"
@@ -1525,7 +1560,8 @@ class DocAgent:
             "Ты — редактор CHANGELOG.md. Этот файл содержит историю "
             "изменений только документации анализируемого проекта. "
             "Служебные файлы самого инструмента документирования "
-            "(SUMMARY.md, CHANGELOG.md и т.п.) в него не попадают.\n\n"
+            "(SUMMARY.md, CHANGELOG.md, SAMPLE.md, SAMPLES.md и т.п.) "
+            "в него не попадают. ЗАПРЕЩЕНО упоминать эти файлы в записи.\n\n"
             "Твоя задача — изучить изменения "
             f"между {old_tag} и {latest_tag} и написать новую запись "
             "для CHANGELOG.md.\n\n"
@@ -1539,9 +1575,9 @@ class DocAgent:
             "  • collect_changelog — собрать коммиты и changelog-файлы "
             f"проекта между {old_tag} и {latest_tag}.\n"
             "  • submit_changelog_entry — добавить новую запись "
-            "в CHANGELOG.md. Вызови этот инструмент с текстом новой "
-            "записи. Предыдущие записи не пострадают — заголовок "
-            "добавится автоматически.\n\n"
+            "в CHANGELOG.md. ЗАГОЛОВОК ФОРМИРУЕТСЯ АВТОМАТИЧЕСКИ. "
+            "Передай from_ref, to_ref и content (тело записи без заголовка). "
+            "Предыдущие записи не пострадают.\n\n"
             "Каждая запись содержит две секции:\n"
             "1. Изменения в проекте — на основе коммитов между "
             f"{old_tag} и {latest_tag} (git log, collect_changelog).\n"
@@ -1551,32 +1587,20 @@ class DocAgent:
             "   - Изменено docgen — файлы, которые обработал docgen.\n"
             "   - Изменено разработчиками — файлы, которые "
             "изменили разработчики в git.\n\n"
-            "Формат записи:\n"
-            f"## [{now_str}] {old_tag} -> {latest_tag}\n\n"
-            "### Изменения в проекте\n"
-            "2-5 предложений: ключевые изменения в коде проекта "
-            "(новые фичи, исправления, рефакторинг). "
-            "Бери информацию из коммитов.\n\n"
-            "### Изменения в документации\n"
-            "#### Изменено docgen\n"
-            "- файл.md (кратко: что сделано)\n\n"
-            "#### Изменено разработчиками\n"
-            "- файл.md (кратко: что изменилось)\n\n"
             "Подсекции включай только если есть соответствующие "
             "изменения.\n\n"
-            "ВАЖНЫЕ ПРАВИЛА:\n"
-            "- CHANGELOG.md документирует исключительно изменения "
-            "документации анализируемого проекта. "
-            "Никакой информации о работе инструмента "
-            "документирования (обновлении SUMMARY.md, "
-            "создании/изменении самого CHANGELOG.md или других "
-            "служебных файлов) здесь быть не должно.\n"
-            "- НЕ пиши отдельную запись про работу docgen — "
-            "только одна запись на переход между версиями.\n"
-            "- Пиши на русском языке.\n"
-            "- Факты проверяй через collect_changelog и terminal.\n"
-            "- Сначала изучи изменения, затем вызови "
-            "submit_changelog_entry с готовой записью.\n"
+            "СТРОГИЕ ПРАВИЛА (нарушение недопустимо):\n"
+            "1. ЗАПРЕЩЕНО включать в запись SUMMARY.md, CHANGELOG.md, "
+            "SAMPLE.md, SAMPLES.md или любые другие служебные файлы "
+            "инструмента документирования.\n"
+            "2. ЗАПРЕЩЕНО писать про работу docgen, обновление SUMMARY.md "
+            "или создание/изменение самого CHANGELOG.md.\n"
+            "3. Только одна запись на переход между версиями.\n"
+            "4. Пиши на русском языке.\n"
+            "5. Факты проверяй через collect_changelog и terminal.\n"
+            "6. Сначала изучи изменения, затем вызови "
+            "submit_changelog_entry с from_ref, to_ref и content "
+            "(без заголовка ##).\n"
         )
 
         # Формируем информацию о файлах, обработанных docgen и разработчиками

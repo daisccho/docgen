@@ -174,23 +174,31 @@
       {tokens:['❌','⚠','✋','[ERROR','Traceback','--- STDERR','FAILED'], cls:'cl-error'},
       {tokens:['✅','✔','Успешно','готов'], cls:'cl-ok'},
       {tokens:['🔧','$ '], cls:'cl-cmd'},
-      {tokens:['🤔'], cls:'cl-think'},
+      {tokens:['🤔','│','└'], cls:'cl-think'},
       {tokens:['📝','📄','➕','↔','🗑'], cls:'cl-file'},
       {tokens:['⏱'], cls:'cl-time'},
       {tokens:['⏳','💤'], cls:'cl-wait'},
       {tokens:['▶','╔══'], cls:'cl-heading'},
     ];
+    let prevClass = null;
     for (let i = 0; i < lines.length; i++) {
       if (i > 0) frag.appendChild(document.createTextNode('\n'));
       const ln = lines[i];
       const rule = rules.find(r => r.tokens.some(token => ln.includes(token)));
-      if (!rule) {
-        frag.appendChild(document.createTextNode(ln));
-      } else {
+      if (rule) {
+        prevClass = (rule.cls === 'cl-think' || rule.cls === 'cl-cmd') ? rule.cls : null;
         const s = document.createElement('span');
         s.className = rule.cls;
         s.textContent = ln;
         frag.appendChild(s);
+      } else if (prevClass && ln.trim()) {
+        const s = document.createElement('span');
+        s.className = prevClass;
+        s.textContent = ln;
+        frag.appendChild(s);
+      } else {
+        prevClass = null;
+        frag.appendChild(document.createTextNode(ln));
       }
     }
     output.appendChild(frag);
