@@ -83,7 +83,6 @@ docgen watch -t <time>
 
 Для начала нужно подготовить и запустить сервер веб-сайта:
 ```bash
-python manage.py makemigrations
 python manage.py migrate
 python manage.py createsuperuser
 python manage.py runserver
