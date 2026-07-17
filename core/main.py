@@ -90,7 +90,6 @@ def cli(ctx: click.Context, verbose: bool) -> None:
 
 @cli.command()
 @click.option("--repo", required=True, help="URL git-репозитория (https://...)")
-@click.option("--branch", default="main", help="Основная ветка репозитория")
 @click.option("--github-token-env", default=None,
               help="Имя переменной окружения с GitHub-токеном")
 @click.option("--api-key", default=None, help="API-ключ LLM (или OPENAI_API_KEY в env)")
@@ -101,7 +100,7 @@ def cli(ctx: click.Context, verbose: bool) -> None:
               help="Максимум ходов (по умолч. 10)")
 @click.option("--provider", default=None,
               help="Провайдер LLM (openai, anthropic, openrouter)")
-def init(repo: str, branch: str, github_token_env: Optional[str], api_key: Optional[str],
+def init(repo: str, github_token_env: Optional[str], api_key: Optional[str],
          base_url: Optional[str], model: str, project: str,
          iterations: Optional[int], provider: Optional[str]) -> None:
     """Инициализировать проект docgen в текущей папке.
@@ -117,7 +116,6 @@ def init(repo: str, branch: str, github_token_env: Optional[str], api_key: Optio
 
     state = init_project(
         git_repo=repo,
-        git_branch=branch,
         llm_api_key=api_key,
         llm_model=model,
         llm_base_url=base_url,
@@ -211,14 +209,13 @@ def snapshot(ctx: click.Context, release: Optional[str],
 @cli.command()
 @click.option("--interval", "-t", default=10, type=int,
               help="Интервал проверки новых релизов в минутах")
-@click.option("--branch", default=None, help="Основная ветка репозитория")
 @click.option("--iterations", "-i", default=None, type=int,
               help="Максимум ходов (вызовов terminal) на один .md")
 @click.option("--log", "-l", is_flag=True, help="Логировать в logs/")
 @click.option("--log-file", help="Путь к файлу лога (заменяет --log)")
 @click.option("--verbose", "-v", is_flag=True, help="Подробный вывод")
 @click.pass_context
-def watch(ctx: click.Context, interval: int, branch: Optional[str],
+def watch(ctx: click.Context, interval: int,
           iterations: Optional[int], log: bool,
           log_file: Optional[str],
           verbose: bool) -> None:
@@ -243,10 +240,7 @@ def watch(ctx: click.Context, interval: int, branch: Optional[str],
                          log_file=log_file)
         if iterations is not None:
             agent._max_turns = iterations
-        agent.watch(
-            interval=interval,
-            branch=branch or state.config.git_branch,
-        )
+        agent.watch(interval=interval)
     except KeyboardInterrupt:
         click.echo("\n  ✋ Остановлено пользователем.")
         sys.exit(0)

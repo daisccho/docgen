@@ -109,7 +109,6 @@ def save_release_map(release_map: ReleaseMap, path: Optional[str] = None) -> Pat
 
 def init_project(
     git_repo: str,
-    git_branch: Optional[str] = None,
     llm_api_key: Optional[str] = None,
     llm_model: Optional[str] = None,
     llm_base_url: Optional[str] = None,
@@ -124,8 +123,6 @@ def init_project(
     Также создаётся пустой .release-map.yaml.
     """
     state = _default_state(git_repo)
-    if git_branch:
-        state.config.git_branch = git_branch
     if llm_api_key:
         state.config.llm_api_key = llm_api_key
     if llm_model:

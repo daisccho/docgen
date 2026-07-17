@@ -61,7 +61,6 @@ class GenerationResult(BaseModel):
 class ProjectConfig(BaseModel):
     """Конфигурация проекта docgen."""
     git_repo: str = Field(description="URL git-репозитория")
-    git_branch: str = Field("main", description="Основная ветка репозитория")
     github_token_env: Optional[str] = Field(
         None,
         description="Имя переменной окружения с GitHub-токеном (не сам токен)",

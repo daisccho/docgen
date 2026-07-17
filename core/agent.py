@@ -342,7 +342,7 @@ class DocAgent:
 
         return result
 
-    def watch(self, interval: int, branch: str = "main") -> None:
+    def watch(self, interval: int) -> None:
         """Запустить демон: fetch → обновление → сон."""
         self._log_open("watch")
         if self.verbose:
@@ -355,12 +355,12 @@ class DocAgent:
         if self.verbose:
             self._log(f"  [agent]   ✅ Клон готов ({time.monotonic() - t0:.1f}с)")
         if self.verbose:
-            self._log(f"\n  [agent] ▶ Watch запущен: ветка {branch}, интервал {interval} мин")
+            self._log(f"\n  [agent] ▶ Watch запущен, интервал {interval} мин")
             self._log(f"  [agent]   Рабочая папка: {self._work_dir}")
 
         while True:
             try:
-                self._watch_tick(branch)
+                self._watch_tick()
             except Exception as exc:
                 self._log(f"  [agent]   ⚠ Ошибка: {exc}")
 
@@ -371,7 +371,7 @@ class DocAgent:
 
     # ── Внутренние методы ────────────────────────────────
 
-    def _watch_tick(self, branch: str) -> None:
+    def _watch_tick(self) -> None:
         """Один такт watch: fetch → проверить теги → обновить."""
         if self.verbose:
             self._log(f"  [agent]   ⏳ Fetch тегов {self.state.config.git_repo}...")
