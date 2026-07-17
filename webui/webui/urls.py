@@ -4,6 +4,8 @@ from . import views
 
 urlpatterns = [
     path("", views.dashboard, name="dashboard"),
+    path("settings/", views.system_settings, name="system-settings"),
+    path("help/", views.user_guide, name="user-guide"),
     path("projects/new/", views.project_create, name="project-create"),
     path("projects/<slug:slug>/", views.project_detail, name="project-detail"),
     path(
@@ -28,4 +30,5 @@ urlpatterns = [
         name="document-detail",
     ),
     path("jobs/<int:pk>/", views.job_detail, name="job-detail"),
+    path("jobs/<int:pk>/retry/", views.job_retry, name="job-retry"),
 ]

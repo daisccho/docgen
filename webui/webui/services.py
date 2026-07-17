@@ -12,7 +12,7 @@ from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
-from .models import DocumentVersion, Job, Project
+from .models import DocumentVersion, GlobalSettings, Job, Project
 from core.git_analyzer import sanitize_tag_name
 
 
@@ -26,6 +26,41 @@ def enqueue_job(project: Project, kind: str, user=None, **parameters) -> Job:
         requested_by=user if getattr(user, "is_authenticated", False) else None,
         parameters=parameters,
     )
+
+
+def retry_job(job: Job) -> bool:
+    """Requeue the same failed job while preserving its ID."""
+    with transaction.atomic():
+        locked = Job.objects.select_for_update().filter(pk=job.pk).first()
+        if not locked or locked.status not in (
+            Job.Status.FAILED,
+            Job.Status.CANCELLED,
+        ):
+            return False
+        parameters = dict(locked.parameters or {})
+        parameters.pop("pid", None)
+        locked.status = Job.Status.QUEUED
+        locked.output = ""
+        locked.log_path = ""
+        locked.error = ""
+        locked.started_at = None
+        locked.finished_at = None
+        locked.retry_count += 1
+        locked.parameters = parameters
+        locked.save(
+            update_fields=[
+                "status",
+                "output",
+                "log_path",
+                "error",
+                "started_at",
+                "finished_at",
+                "retry_count",
+                "parameters",
+            ]
+        )
+    job.refresh_from_db()
+    return True
 
 
 def claim_next_job() -> Job | None:
@@ -82,6 +117,7 @@ def execute_job(job: Job) -> None:
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             log_path = job.project.workspace_path / "logs" / f"{kind_dir}_{stamp}.log"
             job.log_path = str(log_path)
+            job.save(update_fields=["log_path"])
 
         command = build_command(job)
         workspace = job.project.workspace_path
@@ -94,11 +130,8 @@ def execute_job(job: Job) -> None:
                 command,
                 cwd=workspace,
                 env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
             job.parameters = {**job.parameters, "pid": proc.pid}
             job.save(update_fields=["parameters", "log_path"])
@@ -125,43 +158,39 @@ def execute_job(job: Job) -> None:
         job.status = Job.Status.FAILED
         job.error = str(exc)
     finally:
-        if job.kind != Job.Kind.WATCH:
+        if job.kind != Job.Kind.WATCH or job.status == Job.Status.FAILED:
             job.finished_at = timezone.now()
             job.save(update_fields=["status", "output", "error", "finished_at"])
 
 
 def build_command(job: Job) -> list[str]:
     python = settings.DOCGEN_PYTHON or sys.executable
-    # Ищем docgen CLI (установленный entry point) в том же окружении
-    import shutil
-    docgen_exe = shutil.which("docgen")
-    if docgen_exe:
-        base = [docgen_exe]
-    else:
-        # Fallback: в том же каталоге, что и python
-        bin_dir = os.path.dirname(python)
-        docgen_exe = os.path.join(bin_dir, "docgen")
-        base = [docgen_exe] if os.path.exists(docgen_exe) else [python, "-m", "docgen"]
+    # Запускаем ядро из того же окружения, что и Django worker. Это исключает
+    # случайный выбор старого исполняемого файла docgen из PATH.
+    base = [python, "-m", "core"]
     project = job.project
+    common = GlobalSettings.load()
+    base_url = common.llm_base_url or project.llm_base_url
+    has_github_token = common.has_github_token or project.has_github_token
 
     if job.kind == Job.Kind.INITIALIZE:
         command = base + [
             "init",
             "--repo",
             project.repository_url,
+            "--branch",
+            project.default_branch,
             "--model",
-            project.llm_model,
+            common.llm_model,
             "--project",
             project.slug,
             "-i",
-            str(project.max_iterations),
-            "--provider",
-            project.llm_provider,
+            str(common.max_iterations),
         ]
-        if project.llm_base_url:
-            command += ["--base-url", project.llm_base_url]
+        if base_url:
+            command += ["--base-url", base_url]
         github_token_env = (
-            "DOCGEN_GITHUB_TOKEN" if project.has_github_token else project.github_token_env
+            "DOCGEN_GITHUB_TOKEN" if has_github_token else project.github_token_env
         )
         if github_token_env:
             command += ["--github-token-env", github_token_env]
@@ -180,7 +209,14 @@ def build_command(job: Job) -> list[str]:
         return command
 
     if job.kind == Job.Kind.WATCH:
-        command = base + ["watch", "-v", "-t", str(job.project.watch_interval)]
+        command = base + [
+            "watch",
+            "-v",
+            "-t",
+            str(job.project.watch_interval),
+            "--branch",
+            job.project.default_branch,
+        ]
         if job.log_path:
             command += ["--log-file", job.log_path]
         else:
@@ -196,17 +232,23 @@ def build_job_environment(project: Project) -> dict[str, str]:
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
 
-    if project.has_llm_api_key:
+    common = GlobalSettings.load()
+    if common.has_llm_api_key:
+        env["OPENAI_API_KEY"] = common.get_llm_api_key()
+    elif project.has_llm_api_key:
         env["OPENAI_API_KEY"] = project.get_llm_api_key()
     elif project.api_key_env and project.api_key_env != "OPENAI_API_KEY":
         api_key = env.get(project.api_key_env)
         if api_key:
             env["OPENAI_API_KEY"] = api_key
 
-    if project.has_github_token:
+    if common.has_github_token:
+        env["DOCGEN_GITHUB_TOKEN"] = common.get_github_token()
+    elif project.has_github_token:
         env["DOCGEN_GITHUB_TOKEN"] = project.get_github_token()
-    if project.llm_base_url:
-        env["OPENAI_BASE_URL"] = project.llm_base_url
+    base_url = common.llm_base_url or project.llm_base_url
+    if base_url:
+        env["OPENAI_BASE_URL"] = base_url
     return env
 
 
@@ -220,12 +262,19 @@ def sync_project_runtime_config(project: Project) -> None:
     except (OSError, yaml.YAMLError, TypeError):
         return
     config = data.setdefault("config", {})
-    config["llm_model"] = project.llm_model
-    config["llm_provider"] = project.llm_provider
-    config["llm_base_url"] = project.llm_base_url or None
+    common = GlobalSettings.load()
+    base_url = common.llm_base_url or project.llm_base_url
+    has_github_token = common.has_github_token or project.has_github_token
+    config["git_branch"] = project.default_branch
+    config["llm_model"] = common.llm_model
+    config["llm_provider"] = "openai"
+    config["llm_base_url"] = base_url or None
+    config["max_turns"] = common.max_iterations
     config["llm_api_key"] = None
     config["github_token_env"] = (
-        "DOCGEN_GITHUB_TOKEN" if project.has_github_token else project.github_token_env or None
+        "DOCGEN_GITHUB_TOKEN"
+        if has_github_token
+        else project.github_token_env or None
     )
     config_path.write_text(
         yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8"

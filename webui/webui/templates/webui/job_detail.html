@@ -18,11 +18,31 @@
   </div>
   <div class="actions" style="flex-direction:column;align-items:flex-end">
     <span class="status {{ job.status }}">{{ job.get_status_display }}</span>
-    {% if job.error %}
-      <pre class="error-log" style="max-width:320px;font-size:11px;margin:4px 0 0">{{ job.error }}</pre>
-    {% endif %}
+    {% if job.retry_count %}<span class="muted">Повторов: {{ job.retry_count }}</span>{% endif %}
   </div>
 </div>
+
+{% if job.error %}
+<section class="card job-panel">
+  <h2>Ошибка</h2>
+  <pre class="error-log">{{ job.error }}</pre>
+  <div class="notice"><strong>Как исправить:</strong> {{ job.error_hint }}</div>
+  {% if job.status == "failed" or job.status == "cancelled" %}
+  <form method="post" action="{% url 'job-retry' job.pk %}">
+    {% csrf_token %}
+    <button class="button primary">Повторить выполнение</button>
+  </form>
+  {% endif %}
+</section>
+{% elif job.status == "cancelled" %}
+<section class="card job-panel">
+  <div class="notice">Задание отменено. При необходимости его можно повторно поставить в очередь с тем же ID.</div>
+  <form method="post" action="{% url 'job-retry' job.pk %}">
+    {% csrf_token %}
+    <button class="button primary">Повторить выполнение</button>
+  </form>
+</section>
+{% endif %}
 
 <section class="section">
   <h2>Вывод</h2>
@@ -150,21 +170,25 @@
     // Иначе — раскраска по префиксам
     const lines = text.split('\n');
     const frag = document.createDocumentFragment();
-    const pf = {
-      '❌':'#f85149','⚠':'#f85149','✋':'#f85149','✅':'#3fb950',
-      '🔧':'#58a6ff','$':'#58a6ff','🤔':'#d29922','📝':'#39d2c0',
-      '⏱':'#bc8cff','⏳':'#c9d1d9','💤':'#c9d1d9','▶':'#e6edf3',
-    };
+    const rules = [
+      {tokens:['❌','⚠','✋','[ERROR','Traceback','--- STDERR','FAILED'], cls:'cl-error'},
+      {tokens:['✅','✔','Успешно','готов'], cls:'cl-ok'},
+      {tokens:['🔧','$ '], cls:'cl-cmd'},
+      {tokens:['🤔'], cls:'cl-think'},
+      {tokens:['📝','📄','➕','↔','🗑'], cls:'cl-file'},
+      {tokens:['⏱'], cls:'cl-time'},
+      {tokens:['⏳','💤'], cls:'cl-wait'},
+      {tokens:['▶','╔══'], cls:'cl-heading'},
+    ];
     for (let i = 0; i < lines.length; i++) {
       if (i > 0) frag.appendChild(document.createTextNode('\n'));
       const ln = lines[i];
-      const key = Object.keys(pf).find(k => ln.trimStart().startsWith(k));
-      const color = key ? pf[key] : '#8b949e';
-      if (color === '#8b949e' && !key) {
+      const rule = rules.find(r => r.tokens.some(token => ln.includes(token)));
+      if (!rule) {
         frag.appendChild(document.createTextNode(ln));
       } else {
         const s = document.createElement('span');
-        s.style.cssText = 'color:' + color;
+        s.className = rule.cls;
         s.textContent = ln;
         frag.appendChild(s);
       }

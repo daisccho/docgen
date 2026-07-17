@@ -43,3 +43,12 @@ mark.cl-search{background:rgba(210,153,34,.35);border-radius:2px;padding:0 1px;c
 /* — Status bar — */
 .term-statusbar{display:flex;justify-content:space-between;align-items:center;padding:4px 14px;background:#161b22;border-top:1px solid #30363d;font-size:11px;color:#8b949e;user-select:none}
 .term-tail-indicator{color:#28c840}
+
+/* — Settings and guide — */
+.secret-state{display:flex;flex-wrap:wrap;gap:12px;margin:18px 0}
+.secret-state span{background:#eef3ef;border:1px solid var(--line);border-radius:999px;padding:7px 12px;font-size:13px}
+.guide{display:grid;gap:16px}
+.guide>h1,.guide>.eyebrow{margin-bottom:0}
+.guide-note{padding:24px}
+.guide-note h2{margin-top:0}
+.guide-note p{margin-bottom:0;line-height:1.65}

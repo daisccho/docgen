@@ -3,14 +3,21 @@ from __future__ import annotations
 from pathlib import Path
 
 from django.contrib import messages
+from django.contrib.admin.views.decorators import staff_member_required
 from django.contrib.auth.decorators import login_required
 from django.http import Http404, HttpRequest, HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.http import require_POST
 
-from .forms import ProjectForm
-from .models import DocumentVersion, Job, Project
-from .services import _check_stale_watch_jobs, enqueue_job, safe_document_path, sync_versions
+from .forms import GlobalSettingsForm, ProjectForm
+from .models import DocumentVersion, GlobalSettings, Job, Project
+from .services import (
+    _check_stale_watch_jobs,
+    enqueue_job,
+    retry_job,
+    safe_document_path,
+    sync_versions,
+)
 
 
 @login_required
@@ -22,6 +29,26 @@ def dashboard(request: HttpRequest) -> HttpResponse:
         "webui/dashboard.html",
         {"projects": projects, "recent_jobs": recent_jobs},
     )
+
+
+@staff_member_required
+def system_settings(request: HttpRequest) -> HttpResponse:
+    common = GlobalSettings.load()
+    form = GlobalSettingsForm(request.POST or None, instance=common)
+    if request.method == "POST" and form.is_valid():
+        form.save()
+        messages.success(request, "Общие настройки сохранены.")
+        return redirect("system-settings")
+    return render(
+        request,
+        "webui/system_settings.html",
+        {"form": form, "common": common},
+    )
+
+
+@login_required
+def user_guide(request: HttpRequest) -> HttpResponse:
+    return render(request, "webui/user_guide.html")
 
 
 @login_required
@@ -71,6 +98,7 @@ def project_detail(request: HttpRequest, slug: str) -> HttpResponse:
             "init_status": init_status,
             "init_label": init_label,
             "watch_active": watch_active,
+            "common": GlobalSettings.load(),
         },
     )
 
@@ -162,6 +190,20 @@ def job_detail(request: HttpRequest, pk: int) -> HttpResponse:
             pass
     template = "webui/_job_output.html" if request.GET.get("partial") == "1" else "webui/job_detail.html"
     return render(request, template, {"job": job, "file_output": file_output})
+
+
+@login_required
+@require_POST
+def job_retry(request: HttpRequest, pk: int) -> HttpResponse:
+    job = get_object_or_404(Job, pk=pk)
+    if retry_job(job):
+        messages.success(request, f"Задание #{job.pk} повторно поставлено в очередь.")
+    else:
+        messages.error(
+            request,
+            "Повторить можно только ошибочное или отменённое задание.",
+        )
+    return redirect("job-detail", pk=job.pk)
 
 
 @login_required

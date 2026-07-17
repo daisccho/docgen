@@ -67,11 +67,14 @@
   <section class="card facts">
     <h2>Настройки</h2>
     <dl>
+      <dt>ID</dt><dd><code>{{ project.slug }}</code></dd>
       <dt>Ветка</dt><dd>{{ project.default_branch }}</dd>
-      <dt>Модель</dt><dd>{{ project.llm_model }}</dd>
-      <dt>Base URL</dt><dd>{{ project.llm_base_url|default:"OpenAI" }}</dd>
-      <dt>API-ключ</dt><dd>{% if project.has_llm_api_key %}Сохранён{% else %}Не задан{% endif %}</dd>
-      <dt>GitHub-токен</dt><dd>{% if project.has_github_token %}Сохранён{% else %}Не задан{% endif %}</dd>
+      <dt>Watch</dt><dd>{{ project.watch_interval }} мин</dd>
+      <dt>Модель</dt><dd>{{ common.llm_model }}</dd>
+      <dt>Base URL</dt><dd>{{ common.llm_base_url|default:"OpenAI" }}</dd>
+      <dt>Ходы агента</dt><dd>{{ common.max_iterations }}</dd>
+      <dt>API-ключ</dt><dd>{% if common.has_llm_api_key or project.has_llm_api_key %}Сохранён{% else %}Не задан{% endif %}</dd>
+      <dt>GitHub-токен</dt><dd>{% if common.has_github_token or project.has_github_token %}Сохранён{% else %}Не задан{% endif %}</dd>
       <dt>Рабочий каталог</dt><dd><code>{{ project.workspace_path }}</code></dd>
     </dl>
   </section>
@@ -109,7 +112,7 @@
             <tr>
               <td><a href="{% url 'job-detail' job.pk %}">#{{ job.pk }}</a></td>
               <td>{{ job.get_kind_display }}</td>
-              <td><span class="status {{ job.status }}">{{ job.get_status_display }}</span></td>
+              <td><span class="status {{ job.status }}">{{ job.get_status_display }}</span>{% if job.retry_count %} <span class="muted">· повторов: {{ job.retry_count }}</span>{% endif %}</td>
               <td>{{ job.created_at|date:"d.m.Y H:i" }}</td>
             </tr>
           {% endif %}

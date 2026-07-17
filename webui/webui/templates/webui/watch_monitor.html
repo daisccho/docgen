@@ -122,11 +122,20 @@
     if (/\u001b\[/.test(text)) { output.appendChild(ansiToHtml(text)); return; }
     const lines = text.split('\n');
     const frag = document.createDocumentFragment();
-    const pf = { '❌':'#f85149','⚠':'#f85149','✋':'#f85149','✅':'#3fb950','🔧':'#58a6ff','$':'#58a6ff','🤔':'#d29922','📝':'#39d2c0','⏱':'#bc8cff','⏳':'#c9d1d9','💤':'#c9d1d9','▶':'#e6edf3' };
+    const rules = [
+      {tokens:['❌','⚠','✋','[ERROR','Traceback','--- STDERR','FAILED'], cls:'cl-error'},
+      {tokens:['✅','✔','Успешно','готов'], cls:'cl-ok'},
+      {tokens:['🔧','$ '], cls:'cl-cmd'},
+      {tokens:['🤔'], cls:'cl-think'},
+      {tokens:['📝','📄','➕','↔','🗑'], cls:'cl-file'},
+      {tokens:['⏱'], cls:'cl-time'},
+      {tokens:['⏳','💤'], cls:'cl-wait'},
+      {tokens:['▶','╔══'], cls:'cl-heading'},
+    ];
     for (let i = 0; i < lines.length; i++) {
       if (i > 0) frag.appendChild(document.createTextNode('\n'));
-      const key = Object.keys(pf).find(k => lines[i].trimStart().startsWith(k));
-      if (key) { const s = document.createElement('span'); s.style.cssText = 'color:'+pf[key]; s.textContent = lines[i]; frag.appendChild(s); }
+      const rule = rules.find(r => r.tokens.some(token => lines[i].includes(token)));
+      if (rule) { const s = document.createElement('span'); s.className = rule.cls; s.textContent = lines[i]; frag.appendChild(s); }
       else { frag.appendChild(document.createTextNode(lines[i])); }
     }
     output.appendChild(frag);

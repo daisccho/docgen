@@ -6,16 +6,25 @@
   <a class="button primary" href="{% url 'project-create' %}">Добавить проект</a>
 </div>
 
-<section class="project-grid">
+<section class="card table-wrap">
+  <table class="projects-table">
+    <thead><tr><th>Проект</th><th>Идентификатор</th><th>Репозиторий</th><th>Ветка</th><th>Интервал watch</th><th>Версии</th><th>Задания</th></tr></thead>
+    <tbody>
   {% for project in projects %}
-    <a class="card project-card" href="{{ project.get_absolute_url }}">
-      <div class="card-head"><h2>{{ project.name }}</h2><span class="badge">{{ project.default_branch }}</span></div>
-      <p class="repo">{{ project.repository_url }}</p>
-      <div class="metrics"><span><strong>{{ project.versions.count }}</strong> версий</span><span><strong>{{ project.jobs.count }}</strong> заданий</span></div>
-    </a>
+    <tr>
+      <td><a href="{{ project.get_absolute_url }}"><strong>{{ project.name }}</strong></a></td>
+      <td><code>{{ project.slug }}</code></td>
+      <td class="repo">{{ project.repository_url }}</td>
+      <td><span class="badge">{{ project.default_branch }}</span></td>
+      <td>{{ project.watch_interval }} мин</td>
+      <td>{{ project.versions.count }}</td>
+      <td>{{ project.jobs.count }}</td>
+    </tr>
   {% empty %}
-    <div class="card empty"><h2>Пока нет проектов</h2><p>Добавьте Git-репозиторий, чтобы создать первое задание.</p></div>
+    <tr><td colspan="7"><div class="empty"><h2>Пока нет проектов</h2><p>Добавьте Git-репозиторий, чтобы создать первое задание.</p></div></td></tr>
   {% endfor %}
+    </tbody>
+  </table>
 </section>
 
 <section class="section">

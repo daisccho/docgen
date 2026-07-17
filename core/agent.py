@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -258,12 +259,17 @@ class DocAgent:
                     self._log(f"  [agent]   ✅ Ref найден ({time.monotonic() - t0:.1f}с)")
             else:
                 if self.verbose:
-                    self._log(f"  [agent]   ⏳ Релизов нет — фетчим HEAD...")
+                    self._log(
+                        "  [agent]   ⏳ Релизов нет — используем ветку "
+                        f"{self.state.config.git_branch}..."
+                    )
                     t0 = time.monotonic()
                 clone_repo(self.state.config.git_repo, self._clone_dir, self._token)
                 if self.verbose:
                     self._log(f"  [agent]   ✅ Клон готов ({time.monotonic() - t0:.1f}с)")
-                commit_hash = get_head_hash(self._clone_dir)
+                commit_hash = ensure_ref_available(
+                    self._clone_dir, self.state.config.git_branch
+                )
 
         if self.verbose:
             label = ref or "HEAD"
@@ -547,6 +553,8 @@ class DocAgent:
                 p: d for p, d in raw_diffs.items()
                 if self._is_relevant_diff(p, rel_path)
             }
+            if not relevant:
+                relevant = raw_diffs
 
             new_content = self._run_agentic_update(
                 old_doc=old_content,
@@ -748,12 +756,12 @@ class DocAgent:
             "У тебя есть доступ к терминалу и специальным инструментам:\n"
             "  • read_summary — прочитать описание проекта (если есть).\n"
             "    Вызови в самом начале, чтобы быстро понять архитектуру.\n"
-            "  • write_summary — после изучения кода сохрани описание "
-            "проекта для будущих запусков.\n"
             "  • collect_changelog — собрать список "
             "изменений между версиями: CHANGELOG'и, подобные им файлы "
             "и комментарии коммитов.\n"
-            "  • terminal — изучай код, diff'ы, читай файлы.\n\n"
+            "  • terminal — текущая папка уже является bare git-"
+            f"репозиторием {self._clone_dir}. Не выполняй cd и не ищи "
+            "рабочую копию; используй git diff, git show и git ls-tree.\n\n"
             "📋 Рекомендуемый порядок:\n"
             "1. Сначала read_summary — пойми, что за проект.\n"
             "2. Затем collect_changelog — узнай, "
@@ -804,7 +812,7 @@ class DocAgent:
         if not content:
             if self.verbose:
                 self._log(f"  [agent]   ⚠ Агентный маппинг вернул пустой ответ")
-        return set()
+            return set()
 
         # Извлекаем JSON из ответа
         json_match = re.search(r"\[.*?\]", content, re.DOTALL)
@@ -879,21 +887,24 @@ class DocAgent:
             "модули, соглашения). Вызови в начале, если не знаком с проектом.\n"
             "  • collect_changelog — понять, какие изменения произошли "
             "в коде (CHANGELOG'и + коммиты).\n"
-            "  • terminal — выполняй команды в репозитории, чтобы:\n"
+            "  • terminal — текущая папка уже является bare git-"
+            f"репозиторием {self._clone_dir}. Используй git show/diff/"
+            "ls-tree без cd, чтобы:\n"
             "  • Изучить, как устроен изменившийся код\n"
             "  • Проверить экспортируемые функции/классы\n"
             "  • Найти соответствие между diff и документом\n"
             "  • Прочитать README или другие .md для контекста\n\n"
-            "Когда будешь готов — просто напиши обновлённый Markdown-документ "
-            "в ответе. Не вызывай инструмент, если он не нужен — "
-            "вывод сразу считается финальной версией.\n\n"
+            "Когда будешь готов — верни обновлённый Markdown-документ "
+            "строго между отдельными строками DOCGEN_DOCUMENT_START и "
+            "DOCGEN_DOCUMENT_END. Не вызывай инструмент, если он не нужен.\n\n"
             "Правила:\n"
             "1. Сохраняй стиль, структуру и терминологию оригинала.\n"
             "2. Обновляй только разделы, которые затрагивает diff.\n"
             "3. Если изменений нет — верни документ как есть.\n"
             "4. Пиши на русском языке, если не указано иное.\n"
             "5. Верни ПОЛНЫЙ обновлённый Markdown-документ.\n"
-            "6. Напиши рассуждения, а затем — финальную версию.\n"
+            "6. Рассуждения выполняй во внутренних шагах. В финальном "
+            "ответе не добавляй пояснений или вводного текста.\n"
             "7. ВАЖНО: у тебя ограниченный бюджет ходов. Не трать всё на "
             "изучение кода — обязательно оставь 1-2 хода, чтобы выдать "
             "обновлённый документ. Если diff незначительный — можно "
@@ -914,8 +925,9 @@ class DocAgent:
             {"role": "user", "content": user_prompt},
         ]
 
-        content = self._run_tool_loop(client, messages, file_path, max_turns,
-                                      from_ref=from_ref, to_ref=to_ref)
+        response = self._run_tool_loop(client, messages, file_path, max_turns,
+                                       from_ref=from_ref, to_ref=to_ref)
+        content = self._extract_document_response(response)
         if not content or len(content) < 50:
             return old_doc
         return content
@@ -927,7 +939,11 @@ class DocAgent:
 
         Возвращает stdout (до 8000 символов) или описание ошибки.
         """
-        # Чёрный список опасных команд
+        write_violation = self._terminal_write_violation(command)
+        if write_violation:
+            return f"[ERROR: изменяющая команда заблокирована: {write_violation}]"
+
+        # Дополнительный чёрный список разрушительных команд
         dangerous = [
             r"rm\s.*-rf\s+(/|\*|\.|~)",   # rm -rf /, rm -rf *, rm -rf ., rm -rf ~
             r"rm\s.*\s/(dev|proc|sys|etc|bin)",  # rm ... /dev /proc ...
@@ -951,6 +967,8 @@ class DocAgent:
                 shell=True,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=30,
                 cwd=self._clone_dir,
             )
@@ -975,6 +993,34 @@ class DocAgent:
             if self.verbose:
                 self._log(f"  [agent]     ⚠ Ошибка: {exc}")
             return f"[ERROR: {exc}]"
+
+    @staticmethod
+    def _terminal_write_violation(command: str) -> Optional[str]:
+        """Вернуть причину блокировки команды, способной менять состояние."""
+        lowered = command.lower()
+        without_safe_stderr = re.sub(
+            r"2\s*>\s*(?:nul|/dev/null|&1)", "", lowered
+        )
+        if re.search(r"(?:>>?|<)", without_safe_stderr):
+            return "перенаправление ввода/вывода"
+
+        mutating_patterns = [
+            r"(?:^|[;&|]\s*)(?:rm|del|erase|rmdir|rd|mv|move|cp|copy|"
+            r"ren|rename|mkdir|md|touch|tee)\b",
+            r"\b(?:set-content|add-content|out-file|new-item|remove-item|"
+            r"move-item|copy-item|clear-content)\b",
+            r"(?:^|[;&|]\s*)(?:python|python3|py|powershell|pwsh|node|"
+            r"ruby|perl)\b",
+            r"\bgit\s+(?:add|am|apply|checkout|cherry-pick|clean|commit|"
+            r"config(?!\s+--get)|merge|mv|push|rebase|reset|restore|rm|"
+            r"switch|tag)\b",
+            r"\bsed\b[^\r\n]*\s-i(?:\s|$)",
+            r"\b(?:curl|wget|invoke-webrequest|start-bitstransfer)\b",
+        ]
+        for pattern in mutating_patterns:
+            if re.search(pattern, lowered):
+                return "команда записи или запуска интерпретатора"
+        return None
 
     def _format_cmd_line(self, cmd: str) -> list[str]:
         """Отформатировать команду с переносом по ширине терминала."""
@@ -1612,7 +1658,18 @@ class DocAgent:
     def _log(self, msg: str) -> None:
         """Вывести в консоль (+ в лог-файл, если включено)."""
         if self.verbose:
-            print(msg, flush=True)
+            try:
+                print(msg, flush=True)
+            except UnicodeEncodeError:
+                stream = sys.stdout
+                reconfigure = getattr(stream, "reconfigure", None)
+                if reconfigure:
+                    reconfigure(encoding="utf-8", errors="replace")
+                    print(msg, flush=True)
+                else:
+                    encoding = getattr(stream, "encoding", None) or "ascii"
+                    safe = msg.encode(encoding, errors="replace").decode(encoding)
+                    print(safe, flush=True)
         if self._log_enabled and self._log_file:
             clean = re.sub(r'\x1b\[[0-9;]*m', '', msg)
             now = datetime.now().strftime("%H:%M:%S")
@@ -1751,8 +1808,10 @@ class DocAgent:
             "4. Пиши на русском языке.\n"
             "5. Не добавляй разделы, которых нет.\n"
             "6. Верни ПОЛНЫЙ документ, не только изменения.\n"
-            "7. После анализа напиши свои рассуждения, а затем — "
-            "финальную версию документа.\n"
+            "7. Рассуждения выполняй во внутренних шагах. В финальном "
+            "ответе не добавляй пояснений, оценок и вводного текста. "
+            "Верни документ строго между отдельными строками "
+            "DOCGEN_DOCUMENT_START и DOCGEN_DOCUMENT_END.\n"
             "8. ВАЖНО: у тебя ограниченный бюджет ходов. Если файл "
             "заведомо актуален или изменения тривиальны — сразу верни "
             "его как есть, не тратя ходы на изучение.\n"
@@ -1771,7 +1830,8 @@ class DocAgent:
             {"role": "user", "content": user_prompt},
         ]
 
-        content = self._run_tool_loop(client, messages, file_path, max_turns)
+        response = self._run_tool_loop(client, messages, file_path, max_turns)
+        content = self._extract_document_response(response, allow_deleted=True)
 
         # Если LLM сказала DELETED или ответ пустой — не трогаем
         if not content or content == "DELETED":
@@ -1783,6 +1843,35 @@ class DocAgent:
 
         return content
 
+    def _extract_document_response(
+        self,
+        response: Optional[str],
+        *,
+        allow_deleted: bool = False,
+    ) -> Optional[str]:
+        """Извлечь только Markdown-документ из финального ответа LLM."""
+        if not response:
+            return None
+
+        stripped = response.strip()
+        if allow_deleted and stripped == "DELETED":
+            return stripped
+
+        start_marker = "DOCGEN_DOCUMENT_START"
+        end_marker = "DOCGEN_DOCUMENT_END"
+        start = stripped.find(start_marker)
+        end = stripped.find(end_marker, start + len(start_marker))
+        if start < 0 or end < 0:
+            if self.verbose:
+                self._log(
+                    "  [agent]     ⚠ Ответ аудита отклонён: "
+                    "нет маркеров документа"
+                )
+            return None
+
+        document = stripped[start + len(start_marker):end].strip()
+        return document or None
+
     # ── Хелперы ──────────────────────────────────────────
 
     @staticmethod
@@ -1793,7 +1882,7 @@ class DocAgent:
             return []
         files: list[str] = []
         for f in sorted(root.rglob("*.md")):
-            rel = str(f.relative_to(root))
+            rel = f.relative_to(root).as_posix()
             files.append(rel)
         return files
 
