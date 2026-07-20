@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -166,6 +167,15 @@ TOOL_DEFS = [
         },
     },
 ]
+
+
+@dataclass
+class PlannerResult:
+    """Результат работы агента-планировщика с контекстом для последующих фаз."""
+    files_to_update: set[str] = field(default_factory=set)
+    summary_content: str = ""
+    changelog_content: str = ""
+    project_overview: str = ""
 
 
 class DocAgent:
@@ -425,7 +435,7 @@ class DocAgent:
             self.snapshot(release_tag=latest_tag, check=True)
             return
 
-        result = self._update_docs(
+        result, planner_result = self._update_docs(
             old_snapshot_dir=old_snapshot_dir,
             new_snapshot_dir=new_snapshot_dir,
             from_ref=old_tag,
@@ -457,6 +467,7 @@ class DocAgent:
             added_files=result.added_files,
             removed_files=result.removed_files,
             developer_md_files=developer_md_files,
+            planner_result=planner_result,
         )
 
         # Обновляем SUMMARY в соответствии с изменениями
@@ -466,6 +477,7 @@ class DocAgent:
             self._ensure_summary(
                 new_snapshot_dir, ref=latest_tag,
                 max_turns=max(5, self._max_turns),
+                planner_result=planner_result,
             )
 
         # Сохраняем состояние в release-map
@@ -498,7 +510,7 @@ class DocAgent:
         to_ref: str,
         copy_new_from_repo: bool = False,
         max_turns: int = 10,
-    ) -> GenerationResult:
+    ) -> tuple[GenerationResult, PlannerResult]:
         """Инкрементальное обновление документации.
 
         Args:
@@ -508,6 +520,11 @@ class DocAgent:
             to_ref: Git-реф конца.
             copy_new_from_repo: Если True — новые .md копируются из
                 репозитория, а не из старого снэпшота.
+
+        Returns:
+            Кортеж (GenerationResult, PlannerResult).
+            PlannerResult содержит кэшированный контекст для
+            последующих фаз (changelog, summary).
         """
         commit_hash = get_head_hash(self._clone_dir, to_ref)
         result = GenerationResult(commit_hash=commit_hash, output_dir=new_snapshot_dir)
@@ -524,19 +541,38 @@ class DocAgent:
         old_md_files: list[str] = self._scan_snapshot_md(old_snapshot_dir)
         new_repo_md = set(scan_md_files(self._clone_dir, to_ref))
 
+        # ── Предзагрузка SUMMARY.md и CHANGELOG.md ──
+        summary_content = ""
+        if os.path.isfile(self._summary_path):
+            with open(self._summary_path, encoding="utf-8") as f:
+                summary_content = f.read()
+        changelog_content = ""
+        if os.path.isfile(self._changelog_path):
+            with open(self._changelog_path, encoding="utf-8") as f:
+                changelog_content = f.read()
+
         # ── Шаг 3: LLM-маппинг (какие .md обновлять) ──
-        docs_to_update: set[str] = set()
+        planner_result = PlannerResult()
         if self._generator and changed_code:
-            docs_to_update = self._map_changes_to_docs_agentic(
+            planner_result = self._map_changes_to_docs_agentic(
                 changed_code, old_md_files, new_repo_md,
                 from_ref, to_ref, max_turns=max_turns,
+                summary_content=summary_content,
+                changelog_content=changelog_content,
             )
         elif self._generator and not changed_code:
             if self.verbose:
                 self._log(f"  [agent]   Нет изменений кода — ничего не обновляем")
+            # Всё равно передаём кэш для changelog/summary
+            planner_result = PlannerResult(
+                summary_content=summary_content,
+                changelog_content=changelog_content,
+            )
         elif not self._generator:
             if self.verbose:
                 self._log(f"  [agent]   ⚠ LLM не настроен — копируем без изменений")
+
+        docs_to_update = planner_result.files_to_update
 
         # ── Шаг 4: копируем старый снэпшот ──
         # Сначала копируем всё из старого снэпшота
@@ -573,6 +609,7 @@ class DocAgent:
                 max_turns=max_turns,
                 from_ref=from_ref,
                 to_ref=to_ref,
+                planner_result=planner_result,
             )
             if new_content:
                 dest = Path(new_snapshot_dir) / rel_path
@@ -614,7 +651,7 @@ class DocAgent:
                     self._log(f"  [agent]   🗑 {md_path} (удалён из репозитория)")
         result.docs_removed = removed
 
-        return result
+        return result, planner_result
 
     # ── LLM-маппинг ──────────────────────────────────────
 
@@ -728,18 +765,20 @@ class DocAgent:
         from_ref: str,
         to_ref: str,
         max_turns: int = 10,
-    ) -> set[str]:
+        summary_content: str = "",
+        changelog_content: str = "",
+    ) -> PlannerResult:
         """Агентный цикл: LLM с доступом к терминалу анализирует diff
         и решает, какие .md-файлы требуют обновления.
 
-        Returns:
-            Множество путей .md, которые нужно обновить.
+        Возвращает PlannerResult с путями файлов и контекстом для
+        последующих фаз (воркеры, changelog, summary).
         """
         if not self._generator:
-            return set()
+            return PlannerResult()
         client = self._generator._client
         if not client:
-            return set()
+            return PlannerResult()
 
         max_turns = max(3, max_turns)
 
@@ -763,20 +802,12 @@ class DocAgent:
         system_prompt = (
             "Ты — аналитик документации. Твоя задача — определить, "
             "какие .md-файлы нужно обновить на основе изменений в коде.\n\n"
-            "У тебя есть доступ к терминалу и специальным инструментам:\n"
-            "  • read_summary — прочитать описание проекта (если есть).\n"
-            "    Вызови в самом начале, чтобы быстро понять архитектуру.\n"
-            "  • collect_changelog — собрать список "
-            "изменений между версиями: CHANGELOG'и, подобные им файлы "
-            "и комментарии коммитов.\n"
+            "Контекст проекта уже предоставлен — тебе не нужно вызывать "
+            "read_summary или collect_changelog для получения информации.\n\n"
+            "У тебя есть доступ к терминалу:\n"
             "  • terminal — текущая папка уже является bare git-"
             f"репозиторием {self._clone_dir}. Не выполняй cd и не ищи "
             "рабочую копию; используй git diff, git show и git ls-tree.\n\n"
-            "📋 Рекомендуемый порядок:\n"
-            "1. Сначала read_summary — пойми, что за проект.\n"
-            "2. Затем collect_changelog — узнай, "
-            "что изменилось (агент сам найдёт CHANGELOG-подобные файлы).\n"
-            "3. Используй terminal для точечной проверки кода.\n\n"
             "Правила:\n"
             "1. Если изменения кода не затрагивают API, интерфейсы или "
             "описанную функциональность — не обновляй .md.\n"
@@ -786,15 +817,32 @@ class DocAgent:
             "возможно, для них нужна документация.\n"
             "4. Если файл .md удалён из репозитория — не помечай его "
             "как требующий обновления.\n"
-            "5. В конце верни ТОЛЬКО JSON-массив с путями .md-файлов, "
-            "которые нужно обновить. Без пояснений.\n"
-            "6. Пример: [\"docs/guide.md\", \"README.md\"]\n"
-            "7. Если ничего не нужно обновлять: []\n"
+            "5. В конце верни ТОЛЬКО JSON без пояснений в формате:\n"
+            '    {"project_overview": "2-3 предложения о проекте: '
+            'архитектура, ключевые пакеты, назначение",\n'
+            '     "files": ["path/to/file1.md", "path/to/file2.md"]}\n'
+            '6. Пример: {"project_overview": "Проект представляет собой...", '
+            '"files": ["docs/guide.md", "README.md"]}\n'
+            "7. Если ничего не нужно обновлять: "
+            '{"project_overview": "...", "files": []}\n'
             "8. ВАЖНО: у тебя ограниченный бюджет ходов. Не трать всё на "
             "изучение — обязательно оставь 1-2 хода, чтобы выдать "
             "финальный JSON. Если исследуешь diff и .md — делай это "
             "быстро и целенаправленно.\n"
         )
+
+        # Добавляем контекст из SUMMARY и CHANGELOG
+        context_section = ""
+        if summary_content:
+            context_section += (
+                "\n### Содержимое SUMMARY.md\n\n"
+                f"{summary_content[:5000]}\n"
+            )
+        if changelog_content:
+            context_section += (
+                "\n### Содержимое CHANGELOG.md\n\n"
+                f"{changelog_content[:5000]}\n"
+            )
 
         user_prompt = (
             f"### Git diff {from_ref[:8]}..{to_ref[:8]}\n\n"
@@ -804,6 +852,7 @@ class DocAgent:
             f"В старом снэпшоте ({total_md} всего, первые 80):\n{md_sample}\n\n"
             f"Новые .md в репозитории:\n{new_md_text}\n\n"
             f"Удалённые .md из репозитория:\n{deleted_md_text}\n\n"
+            f"{context_section}\n"
             f"Определи, какие .md требуют обновления. "
             f"Используй терминал для изучения кода и diff'ов."
         )
@@ -822,38 +871,58 @@ class DocAgent:
         if not content:
             if self.verbose:
                 self._log(f"  [agent]   ⚠ Агентный маппинг вернул пустой ответ")
-            return set()
+            return PlannerResult(
+                summary_content=summary_content,
+                changelog_content=changelog_content,
+            )
 
-        # Извлекаем JSON из ответа
-        json_match = re.search(r"\[.*?\]", content, re.DOTALL)
-        if json_match:
+        # Извлекаем JSON из ответа — поддерживаем новый формат (объект с overview)
+        # и старый (просто массив)
+        files: set[str] = set()
+        overview = ""
+
+        # Пробуем распарсить как JSON-объект (новый формат)
+        obj_match = re.search(r"\{.*\}", content, re.DOTALL)
+        if obj_match:
             try:
-                paths = json.loads(json_match.group())
-                if isinstance(paths, list):
-                    valid = {p for p in paths if p in old_md_files or p in new_md_files}
-                    if self.verbose:
-                        self._log(f"  [agent]   📋 Агент выбрал: {paths}")
-                        filtered = set(paths) - valid
-                        if filtered:
-                            self._log(f"  [agent]   ⚠ Не найдено в снэпшотах: {sorted(filtered)}")
-                        if valid:
-                            self._log(f"  [agent]   ✏️ Будет обновлено: {sorted(valid)}")
-                        else:
-                            self._log(f"  [agent]   ✓ Ничего не требует обновления")
-                    return valid
-                elif self.verbose:
-                    self._log(f"  [agent]   ⚠ Агент вернул не массив: {paths!r}")
-            except Exception as exc:
-                if self.verbose:
-                    self._log(f"  [agent]   ⚠ Ошибка парсинга ответа: {exc}")
-        elif self.verbose:
-            preview = content[:300].replace("\n", " ")
-            self._log(f"  [agent]   ⚠ Не удалось извлечь JSON из ответа:"
-        f"\"{preview}…\"")
+                data = json.loads(obj_match.group())
+                if isinstance(data, dict):
+                    overview = data.get("project_overview", "") or ""
+                    file_list = data.get("files", [])
+                    if isinstance(file_list, list):
+                        files = {p for p in file_list
+                                 if p in old_md_files or p in new_md_files}
+                elif isinstance(data, list):
+                    # Старый формат — просто массив
+                    files = {p for p in data
+                             if p in old_md_files or p in new_md_files}
+            except Exception:
+                pass
+
+        # Fallback: ищем массив (старый формат "[]")
+        if not files:
+            arr_match = re.search(r"\[.*?\]", content, re.DOTALL)
+            if arr_match:
+                try:
+                    data = json.loads(arr_match.group())
+                    if isinstance(data, list):
+                        files = {p for p in data
+                                 if p in old_md_files or p in new_md_files}
+                except Exception:
+                    pass
 
         if self.verbose:
-            self._log(f"  [agent]   ✓ Ничего не требует обновления (пустой результат)")
-        return set()
+            if files:
+                self._log(f"  [agent]   📋 Агент выбрал: {sorted(files)}")
+            else:
+                self._log(f"  [agent]   ✓ Ничего не требует обновления")
+
+        return PlannerResult(
+            files_to_update=files,
+            summary_content=summary_content,
+            changelog_content=changelog_content,
+            project_overview=overview,
+        )
 
     # ── Инструментальный цикл LLM ─────────────────────────
 
@@ -865,12 +934,17 @@ class DocAgent:
         max_turns: int = 10,
         from_ref: Optional[str] = None,
         to_ref: Optional[str] = None,
+        planner_result: Optional[PlannerResult] = None,
     ) -> Optional[str]:
         """Обновить .md-файл через LLM с доступом к терминалу.
 
         LLM может выполнять команды в репозитории (.clone/), чтобы
         изучить код, проверить структуру, найти зависимости и только
         потом сгенерировать обновлённую документацию.
+
+        Если передан planner_result, воркер получает предварительно
+        загруженный контекст (SUMMARY, CHANGELOG, сводку проекта)
+        и не вызывает read_summary/collect_changelog.
 
         max_turns — сколько ходов (вызовов terminal) даётся агенту.
 
@@ -888,15 +962,31 @@ class DocAgent:
         # Формируем диффы для контекста
         diffs_text = self._format_diffs_for_prompt(code_diffs)
 
+        # Контекст от планировщика (если есть)
+        planner_context = ""
+        if planner_result:
+            if planner_result.project_overview:
+                planner_context += (
+                    f"Сводка проекта:\n{planner_result.project_overview}\n\n"
+                )
+            if planner_result.summary_content:
+                planner_context += (
+                    f"Содержимое SUMMARY.md:\n"
+                    f"{planner_result.summary_content[:3000]}\n\n"
+                )
+            if planner_result.changelog_content:
+                planner_context += (
+                    f"Содержимое CHANGELOG.md:\n"
+                    f"{planner_result.changelog_content[:3000]}\n\n"
+                )
+
         system_prompt = (
-            "Ты — технический писатель с доступом к терминалу и "
-            "специальным инструментам.\n"
+            "Ты — технический писатель с доступом к терминалу.\n"
             "Обновляй .md-файл документации на основе изменений в коде.\n\n"
-            "Инструменты:\n"
-            "  • read_summary — прочитать описание проекта (архитектура, "
-            "модули, соглашения). Вызови в начале, если не знаком с проектом.\n"
-            "  • collect_changelog — понять, какие изменения произошли "
-            "в коде (CHANGELOG'и + коммиты).\n"
+            "Контекст проекта (от планировщика) — не вызывай "
+            "read_summary или collect_changelog:\n"
+            f"{planner_context}"
+            "Доступные инструменты:\n"
             "  • terminal — текущая папка уже является bare git-"
             f"репозиторием {self._clone_dir}. Используй git show/diff/"
             "ls-tree без cd, чтобы:\n"
@@ -935,8 +1025,14 @@ class DocAgent:
             {"role": "user", "content": user_prompt},
         ]
 
-        response = self._run_tool_loop(client, messages, file_path, max_turns,
-                                       from_ref=from_ref, to_ref=to_ref)
+        # Воркеру даём только terminal — read_summary/collect_changelog не нужны
+        worker_tools = [t for t in TOOL_DEFS
+                        if t["function"]["name"] == "terminal"]
+        response = self._run_tool_loop(
+            client, messages, file_path, max_turns,
+            from_ref=from_ref, to_ref=to_ref,
+            tools=worker_tools,
+        )
         content = self._extract_document_response(response)
         if not content or len(content) < 50:
             return old_doc
@@ -1074,11 +1170,14 @@ class DocAgent:
         max_turns: int = 10,
         from_ref: Optional[str] = None,
         to_ref: Optional[str] = None,
+        tools: Optional[list[dict]] = None,
     ) -> Optional[str]:
         """Выполнить цикл LLM с инструментами.
 
         Возвращает финальный текст ответа или None.
         """
+        if tools is None:
+            tools = TOOL_DEFS
         for turn in range(max_turns):
             if self.verbose:
                 self._log(f"  [agent]     🤖 Ход {turn+1}/{max_turns}: запрос к LLM...")
@@ -1086,7 +1185,7 @@ class DocAgent:
                 resp = client.chat.completions.create(
                     model=self._generator.model,
                     messages=messages,
-                    tools=TOOL_DEFS,
+                    tools=tools,
                     tool_choice="auto",
                     max_tokens=8192,
                     timeout=120,
@@ -1413,11 +1512,14 @@ class DocAgent:
             self._log(f"  [agent]     ✅ Changelog собран ({elapsed:.1f}с)")
         return "\n\n".join(parts) if parts else "[Изменений между ref'ами не найдено]"
 
-    def _ensure_summary(self, snapshot_dir: str, ref: str, max_turns: int = 10) -> None:
+    def _ensure_summary(
+        self, snapshot_dir: str, ref: str, max_turns: int = 10,
+        planner_result: Optional[PlannerResult] = None,
+    ) -> None:
         """Создать или обновить SUMMARY.md, запустив LLM-агента для изучения проекта.
 
-        Вызывается при каждом snapshot. Если SUMMARY.md уже есть — агент
-        читает его, изучает изменения в проекте и обновляет.
+        Если передан planner_result, агент получает кэшированный
+        CHANGELOG и сводку проекта.
 
         Args:
             snapshot_dir: Директория снэпшота (.md-файлы).
@@ -1503,8 +1605,21 @@ class DocAgent:
             "SUMMARY.md.\n"
         )
 
+        # Добавляем кэшированный контекст от планировщика
+        planner_context = ""
+        if planner_result:
+            if planner_result.project_overview:
+                planner_context += (
+                    f"Сводка проекта:\n{planner_result.project_overview}\n\n"
+                )
+            if planner_result.changelog_content:
+                planner_context += (
+                    f"Текущий CHANGELOG.md:\n{planner_result.changelog_content[:3000]}\n\n"
+                )
+
         if old_summary:
             user_prompt = (
+                f"{planner_context}"
                 f"Ранее созданный SUMMARY.md:\n\n{old_summary[:12000]}\n\n"
                 f"Проверь, актуален ли он для версии {ref}. "
                 "Изучи текущую структуру кода "
@@ -1514,6 +1629,7 @@ class DocAgent:
             )
         else:
             user_prompt = (
+                f"{planner_context}"
                 f"Изучи код в репозитории для версии {ref} и создай SUMMARY.md.\n"
                 "Используй terminal для просмотра структуры.\n"
                 f"ВАЖНО: ты в {self._clone_dir} — bare-репозиторий. "
@@ -1539,8 +1655,12 @@ class DocAgent:
         added_files: Optional[list[str]] = None,
         removed_files: Optional[list[str]] = None,
         developer_md_files: Optional[list[str]] = None,
+        planner_result: Optional[PlannerResult] = None,
     ) -> None:
         """Создать или дополнить CHANGELOG.md, запустив LLM-агента.
+
+        Если передан planner_result, агент получает предварительно
+        загруженный контекст SUMMARY и CHANGELOG.
 
         Args:
             old_tag: Старый тег (от которого).
@@ -1631,6 +1751,16 @@ class DocAgent:
             )
         if dev_info:
             context_parts.append(dev_info)
+        # Добавляем кэшированный контекст от планировщика
+        if planner_result:
+            if planner_result.project_overview:
+                context_parts.append(
+                    f"Сводка проекта:\n{planner_result.project_overview}"
+                )
+            if planner_result.changelog_content:
+                context_parts.append(
+                    f"Текущий CHANGELOG.md:\n{planner_result.changelog_content[:3000]}"
+                )
         context_str = "\n\n".join(context_parts)
 
         instructions = ""
