@@ -5,7 +5,7 @@ import os
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = os.environ.get("DOCGEN_SECRET_KEY", "dev-only-change-me")
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-only-change-me")
 DEBUG = os.environ.get("DOCGEN_DEBUG", "1") == "1"
 ALLOWED_HOSTS = [
     host.strip()
@@ -58,8 +58,14 @@ ASGI_APPLICATION = "webui.asgi.application"
 
 DATABASES = {
     "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": Path(os.environ.get("DOCGEN_DB_PATH", BASE_DIR / "db.sqlite3")),
+        "ENGINE": os.environ.get("DOCGEN_DB_ENGINE", "django.db.backends.sqlite3"),
+        "NAME": os.environ.get("DOCGEN_DB_NAME")
+                or os.environ.get("DOCGEN_DB_PATH")
+                or str(BASE_DIR / "db.sqlite3"),
+        "USER": os.environ.get("DOCGEN_DB_USER", ""),
+        "PASSWORD": os.environ.get("DOCGEN_DB_PASSWORD", ""),
+        "HOST": os.environ.get("DOCGEN_DB_HOST", ""),
+        "PORT": os.environ.get("DOCGEN_DB_PORT", ""),
     }
 }
 
