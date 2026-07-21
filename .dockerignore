@@ -1,0 +1,13 @@
+.venv/
+.hermes/
+.clone/
+workspaces/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+.db.sqlite3
+.venv/
+.env
+*.log
+.DS_Store

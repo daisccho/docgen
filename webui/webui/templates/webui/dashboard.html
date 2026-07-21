@@ -1,0 +1,36 @@
+{% extends "webui/base.html" %}
+{% block title %}Проекты · Docgen{% endblock %}
+{% block content %}
+<div class="page-heading">
+  <div><p class="eyebrow">WORKSPACE</p><h1>Проекты документации</h1></div>
+  <a class="button primary" href="{% url 'project-create' %}">Добавить проект</a>
+</div>
+
+<section class="card table-wrap">
+  <table class="projects-table">
+    <thead><tr><th>Проект</th><th>Идентификатор</th><th>Репозиторий</th><th>Интервал watch</th><th>Версии</th><th>Задания</th></tr></thead>
+    <tbody>
+  {% for project in projects %}
+    <tr>
+      <td><a href="{{ project.get_absolute_url }}"><strong>{{ project.name }}</strong></a></td>
+      <td><code>{{ project.slug }}</code></td>
+      <td class="repo">{{ project.repository_url }}</td>
+      <td>{{ project.watch_interval }} мин</td>
+      <td>{{ project.versions.count }}</td>
+      <td>{{ project.jobs.count }}</td>
+    </tr>
+  {% empty %}
+    <tr><td colspan="6"><div class="empty"><h2>Пока нет проектов</h2><p>Добавьте Git-репозиторий, чтобы создать первое задание.</p></div></td></tr>
+  {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="section">
+  <h2>Последние задания</h2>
+  <div class="card table-wrap">
+    <table><thead><tr><th>ID</th><th>Проект</th><th>Операция</th><th>Статус</th><th>Создано</th></tr></thead>
+    <tbody>{% for job in recent_jobs %}<tr><td><a href="{% url 'job-detail' job.pk %}">#{{ job.pk }}</a></td><td>{{ job.project.name }}</td><td>{{ job.get_kind_display }}</td><td><span class="status {{ job.status }}">{{ job.get_status_display }}</span></td><td>{{ job.created_at|date:"d.m.Y H:i" }}</td></tr>{% empty %}<tr><td colspan="5">Заданий ещё нет.</td></tr>{% endfor %}</tbody></table>
+  </div>
+</section>
+{% endblock %}

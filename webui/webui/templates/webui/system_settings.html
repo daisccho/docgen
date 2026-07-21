@@ -1,0 +1,21 @@
+{% extends "webui/base.html" %}
+{% block title %}Общие настройки · Docgen{% endblock %}
+{% block content %}
+<div class="narrow">
+  <a class="back" href="{% url 'dashboard' %}">← Все проекты</a>
+  <p class="eyebrow">SYSTEM SETTINGS</p>
+  <h1>Общие настройки</h1>
+  <p class="muted">Модель и реквизиты применяются ко всем проектам. Секреты хранятся в зашифрованном виде и не выводятся обратно в форму.</p>
+  <div class="secret-state">
+    <span>API-ключ: <strong>{% if common.has_llm_api_key %}сохранён{% else %}не задан{% endif %}</strong></span>
+    <span>GitHub-токен: <strong>{% if common.has_github_token %}сохранён{% else %}не задан{% endif %}</strong></span>
+  </div>
+  <div class="card form-card">
+    <form method="post" class="stack">
+      {% csrf_token %}
+      {{ form.as_p }}
+      <div class="actions"><a class="button" href="{% url 'dashboard' %}">Отмена</a><button class="button primary" type="submit">Сохранить</button></div>
+    </form>
+  </div>
+</div>
+{% endblock %}

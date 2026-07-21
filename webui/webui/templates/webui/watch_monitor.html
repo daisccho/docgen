@@ -1,0 +1,267 @@
+{% extends "webui/base.html" %}
+{% block title %}Наблюдение #{{ job.pk }} · {{ job.project.name }} · Docgen{% endblock %}
+{% block content %}
+<a class="back" href="{% url 'project-detail' job.project.slug %}">← {{ job.project.name }}</a>
+
+<div class="page-heading">
+  <div>
+    <p class="eyebrow">{{ job.project.name }} · Наблюдение #{{ job.pk }}</p>
+    <h1>Наблюдение</h1>
+    <p class="meta-line">
+      Запущено {{ job.created_at|date:"d.m.Y H:i" }}
+      {% if job.started_at %} · Начато {{ job.started_at|date:"d.m.Y H:i" }}{% endif %}
+    </p>
+  </div>
+  <div class="actions" style="flex-direction:column;align-items:flex-end">
+    <span class="status {{ job.status }}">{{ job.get_status_display }}</span>
+    <form method="post" action="{% url 'watch-stop' job.project.slug %}"
+      onsubmit="return confirm('Остановить наблюдение?')">
+      {% csrf_token %}
+      <button class="button danger" style="font-size:12px;padding:6px 14px;margin-top:6px">⏹ Остановить</button>
+    </form>
+  </div>
+</div>
+
+<div class="term">
+  <div class="term-titlebar">
+    <div class="term-toolbar" style="margin-left:auto">
+      <button class="term-btn" id="term-search-btn" title="Поиск (Ctrl+F)">🔍</button>
+      <button class="term-btn" id="term-copy-btn" title="Копировать вывод">📋</button>
+      <label class="term-tail">
+        <input type="checkbox" id="tail-check" checked>
+        <span>Хвост</span>
+      </label>
+    </div>
+  </div>
+  <div class="term-body" id="term-body">
+    <pre class="term-output" id="log-output"
+      hx-get="{% url 'job-detail' job.pk %}?partial=1"
+      hx-trigger="every 3s"
+      hx-target="#log-output"
+      hx-swap="innerHTML"
+    >{{ file_output|default:job.output|default:"—" }}
+    </pre>
+  </div>
+  <div class="term-search" id="term-search" hidden>
+    <input type="text" id="term-search-input" placeholder="Поиск..." autofocus>
+    <span class="term-search-count" id="term-search-count"></span>
+    <button class="term-btn" id="term-search-prev" title="Назад (Shift+Enter)">▲</button>
+    <button class="term-btn" id="term-search-next" title="Далее (Enter)">▼</button>
+    <button class="term-btn" id="term-search-close" title="Закрыть (Esc)">✕</button>
+  </div>
+  <div class="term-statusbar">
+    <span class="term-status-left">
+      <span id="term-line-count">0</span> строк
+      · <span id="term-byte-count">0</span> байт
+    </span>
+    <span class="term-status-right">
+      <span class="term-tail-indicator" id="tail-indicator">▶ Слежение</span>
+    </span>
+  </div>
+</div>
+
+<script>
+(function() {
+  const output = document.getElementById('log-output');
+  const tailCheck = document.getElementById('tail-check');
+  const tailIndicator = document.getElementById('tail-indicator');
+  let autoScroll = true;
+  let searchIndex = -1;
+  let searchResults = [];
+
+  function scrollToBottom() {
+    if (output && autoScroll) output.scrollTop = output.scrollHeight;
+  }
+
+  const ANSI_COLORS = {
+    30:'#1a1a1a',31:'#f85149',32:'#3fb950',33:'#d29922',
+    34:'#58a6ff',35:'#bc8cff',36:'#39d2c0',37:'#e6edf3',
+    90:'#8b949e',91:'#ff6b6b',92:'#56d364',93:'#e3b341',
+    94:'#79c0ff',95:'#d2a8ff',96:'#56d4dd',97:'#ffffff',
+  };
+
+  function ansiToHtml(text) {
+    const re = /\u001b\[(\d+(?:;\d+)*)m/g;
+    const parts = []; let last = 0, m;
+    let fg = null, bg = null, bold = false, italic = false, uline = false;
+    while ((m = re.exec(text)) !== null) {
+      if (m.index > last) parts.push({t:text.slice(last,m.index),fg,bg,bold,italic,uline});
+      const codes = m[1].split(';').map(Number);
+      for (const c of codes) {
+        if (c === 0) { fg=null;bg=null;bold=false;italic=false;uline=false; }
+        else if (c === 1) bold = true;
+        else if (c === 3) italic = true;
+        else if (c === 4) uline = true;
+        else if (c >= 30 && c <= 37) fg = ANSI_COLORS[c];
+        else if (c >= 90 && c <= 97) fg = ANSI_COLORS[c];
+        else if (c >= 40 && c <= 47) bg = ANSI_COLORS[c - 10];
+        else if (c >= 100 && c <= 107) bg = ANSI_COLORS[c - 60];
+      }
+      last = m.index + m[0].length;
+    }
+    if (last < text.length) parts.push({t:text.slice(last),fg,bg,bold,italic,uline});
+    const frag = document.createDocumentFragment();
+    for (const p of parts) {
+      if (!p.t) continue;
+      const st = [];
+      if (p.fg) st.push('color:'+p.fg);
+      if (p.bg) st.push('background:'+p.bg);
+      if (p.bold) st.push('font-weight:700');
+      if (p.italic) st.push('font-style:italic');
+      if (p.uline) st.push('text-decoration:underline');
+      if (st.length) { const s = document.createElement('span'); s.style.cssText = st.join(';'); s.textContent = p.t; frag.appendChild(s); }
+      else { frag.appendChild(document.createTextNode(p.t)); }
+    }
+    return frag;
+  }
+
+  function colorizeOutput() {
+    if (!output) return;
+    const text = output.textContent || output.innerText || '';
+    output.innerHTML = '';
+    if (/\u001b\[/.test(text)) { output.appendChild(ansiToHtml(text)); return; }
+    const lines = text.split('\n');
+    const frag = document.createDocumentFragment();
+    const rules = [
+      {tokens:['❌','⚠','✋','[ERROR','Traceback','--- STDERR','FAILED'], cls:'cl-error'},
+      {tokens:['✅','✔','Успешно','готов'], cls:'cl-ok'},
+      {tokens:['🔧','$ '], cls:'cl-cmd'},
+      {tokens:['🤔','│','└'], cls:'cl-think'},
+      {tokens:['📝','📄','➕','↔','🗑'], cls:'cl-file'},
+      {tokens:['⏱'], cls:'cl-time'},
+      {tokens:['⏳','💤'], cls:'cl-wait'},
+      {tokens:['▶','╔══'], cls:'cl-heading'},
+    ];
+    let prevClass = null;
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0) frag.appendChild(document.createTextNode('\n'));
+      const ln = lines[i];
+      const rule = rules.find(r => r.tokens.some(token => ln.includes(token)));
+      if (rule) {
+        prevClass = (rule.cls === 'cl-think' || rule.cls === 'cl-cmd') ? rule.cls : null;
+        const s = document.createElement('span'); s.className = rule.cls; s.textContent = ln; frag.appendChild(s);
+      } else if (prevClass && ln.trim()) {
+        const s = document.createElement('span'); s.className = prevClass; s.textContent = ln; frag.appendChild(s);
+      } else {
+        prevClass = null;
+        frag.appendChild(document.createTextNode(ln));
+      }
+    }
+    output.appendChild(frag);
+  }
+
+  function doSearch(query) {
+    searchResults = []; searchIndex = -1;
+    const countEl = document.getElementById('term-search-count');
+    if (!query) { clearHighlights(); if (countEl) countEl.textContent = ''; return; }
+    const walker = document.createTreeWalker(output, NodeFilter.SHOW_TEXT, null, false);
+    let node, idx = 0; const matches = [];
+    while (node = walker.nextNode()) {
+      const text = node.textContent || '';
+      let pos = 0;
+      while ((pos = text.toLowerCase().indexOf(query.toLowerCase(), pos)) !== -1) {
+        matches.push({node, start:pos, end:pos+query.length, globalIdx:idx++});
+        pos += 1;
+      }
+    }
+    const byNode = new Map();
+    for (const m of matches) { if (!byNode.has(m.node)) byNode.set(m.node,[]); byNode.get(m.node).push(m); }
+    clearHighlights();
+    for (const [node, ms] of byNode) {
+      const parent = node.parentNode;
+      const text = node.textContent || '';
+      const frag = document.createDocumentFragment();
+      let last = 0; ms.sort((a,b)=>a.start-b.start);
+      for (const m of ms) {
+        if (m.start > last) frag.appendChild(document.createTextNode(text.slice(last,m.start)));
+        const mark = document.createElement('mark'); mark.className = 'cl-search'; mark.textContent = text.slice(m.start,m.end); frag.appendChild(mark);
+        last = m.end;
+      }
+      if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+      parent.replaceChild(frag, node);
+      ms.forEach(m => { m.node = frag; });
+    }
+    searchResults = matches;
+    if (countEl) countEl.textContent = matches.length ? `1/${matches.length}` : '0';
+    if (matches.length) { searchIndex = 0; scrollToMatch(0); }
+  }
+
+  function scrollToMatch(index) {
+    if (!searchResults.length) return;
+    const m = searchResults[index];
+    const el = m.node.nodeType === 3 ? m.node.parentElement : m.node;
+    if (el) { el.scrollIntoView({block:'center'}); document.querySelectorAll('.cl-search-active').forEach(e=>e.classList.remove('cl-search-active')); const marks = el.querySelectorAll('.cl-search'); if (marks.length) marks[0].classList.add('cl-search-active'); }
+    const countEl = document.getElementById('term-search-count');
+    if (countEl) countEl.textContent = `${index + 1}/${searchResults.length}`;
+  }
+
+  function clearHighlights() {
+    output.querySelectorAll('mark.cl-search').forEach(m => {
+      const parent = m.parentNode;
+      if (parent) { parent.replaceChild(document.createTextNode(m.textContent), m); parent.normalize(); }
+    });
+    document.querySelectorAll('.cl-search-active').forEach(e => e.classList.remove('cl-search-active'));
+  }
+
+  const searchBtn = document.getElementById('term-search-btn');
+  const searchPanel = document.getElementById('term-search');
+  const searchInput = document.getElementById('term-search-input');
+  const searchClose = document.getElementById('term-search-close');
+  const searchPrev = document.getElementById('term-search-prev');
+  const searchNext = document.getElementById('term-search-next');
+  if (searchBtn && searchPanel) {
+    searchBtn.addEventListener('click', () => { searchPanel.hidden = !searchPanel.hidden; if (!searchPanel.hidden) searchInput.focus(); });
+    document.addEventListener('keydown', (e) => {
+      if ((e.ctrlKey||e.metaKey) && e.key==='f') { e.preventDefault(); searchPanel.hidden = false; searchInput.focus(); }
+      if (e.key==='Escape' && !searchPanel.hidden) { searchPanel.hidden = true; clearHighlights(); searchInput.value=''; document.getElementById('term-search-count').textContent = ''; }
+    });
+    searchInput.addEventListener('input', () => doSearch(searchInput.value));
+    searchInput.addEventListener('keydown', (e) => { if (e.key==='Enter') { e.preventDefault(); if (e.shiftKey) searchPrev.click(); else searchNext.click(); } });
+    searchClose.addEventListener('click', () => { searchPanel.hidden = true; clearHighlights(); searchInput.value=''; document.getElementById('term-search-count').textContent = ''; });
+    searchPrev.addEventListener('click', () => { if (!searchResults.length) return; searchIndex = (searchIndex - 1 + searchResults.length) % searchResults.length; scrollToMatch(searchIndex); });
+    searchNext.addEventListener('click', () => { if (!searchResults.length) return; searchIndex = (searchIndex + 1) % searchResults.length; scrollToMatch(searchIndex); });
+  }
+
+  const termBody = document.getElementById('term-body');
+  const termEl = document.querySelector('.term');
+  let resizeStartY = 0, resizeStartH = 0;
+  function makeResizable(el, handle) {
+    handle.addEventListener('mousedown', (e) => { e.preventDefault(); resizeStartY = e.clientY; resizeStartH = el.offsetHeight; document.addEventListener('mousemove', onResize); document.addEventListener('mouseup', stopResize, {once:true}); });
+  }
+  function onResize(e) { const newH = Math.max(200, resizeStartH + e.clientY - resizeStartY); termBody.style.height = newH + 'px'; }
+  function stopResize() { document.removeEventListener('mousemove', onResize); }
+  const resizeHandle = document.createElement('div'); resizeHandle.className = 'term-resize-handle'; termEl.appendChild(resizeHandle);
+  makeResizable(termBody, resizeHandle);
+
+  const copyBtn = document.getElementById('term-copy-btn');
+  if (copyBtn) {
+    copyBtn.addEventListener('click', () => {
+      const text = output.textContent || output.innerText || '';
+      navigator.clipboard.writeText(text).then(() => { copyBtn.textContent = '✅'; setTimeout(() => { copyBtn.textContent = '📋'; }, 1500); }).catch(() => {
+        const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+        copyBtn.textContent = '✅'; setTimeout(() => { copyBtn.textContent = '📋'; }, 1500);
+      });
+    });
+  }
+
+  if (tailCheck) {
+    tailCheck.addEventListener('change', function() { autoScroll = this.checked; if (autoScroll) scrollToBottom(); tailIndicator.textContent = autoScroll ? '▶ Слежение' : '⏸ Пауза'; });
+  }
+
+  function updateStats() {
+    const text = output.textContent || output.innerText || '';
+    document.getElementById('term-line-count').textContent = (text.match(/\n/g)||[]).length + 1;
+    document.getElementById('term-byte-count').textContent = new Blob([text]).size;
+  }
+
+  document.body.addEventListener('htmx:afterSwap', function(evt) {
+    if (evt.detail.target && evt.detail.target.id === 'log-output') {
+      colorizeOutput(); updateStats(); scrollToBottom();
+      if (searchInput && searchInput.value) doSearch(searchInput.value);
+    }
+  });
+
+  colorizeOutput(); updateStats(); scrollToBottom();
+})();
+</script>
+{% endblock %}

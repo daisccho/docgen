@@ -6,35 +6,40 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from docgen.config import (
+from core.config import (
     find_project_root,
     load_release_map,
     save_release_map,
     save_state,
 )
-from docgen.doc_generator import DocGenerator
-from docgen.git_analyzer import (
-    clone_repo,
+from core.doc_generator import DocGenerator
+from core.errors import DocAgentError, RefNotFoundError
+from core.git_analyzer import (
     ensure_clone,
     ensure_ref_available,
     extract_file_from_repo,
     fetch_repo,
+    fetch_tags,
     get_deleted_md_files,
     get_diff_files,
+    get_all_tags_with_hash,
     get_head_hash,
     get_latest_tag,
     get_new_md_files,
     get_raw_diffs,
     get_snapshot_versions,
     read_file_from_repo,
+    sanitize_tag_name,
     scan_md_files,
 )
-from docgen.models import GenerationResult, ProjectState
+from core.models import GenerationResult, ProjectState
 
 CLONE_DIR = ".clone"
 
@@ -82,7 +87,9 @@ TOOL_DEFS = [
             "description": "Записать или обновить SUMMARY.md — файл с общим описанием "
                            "проекта. Вызывай после того, как изучил код и архитектуру "
                            "через терминал, чтобы сохранить понимание проекта для "
-                           "последующих запусков. Пиши на русском языке.",
+                           "последующих запусков. Передавай содержимое напрямую "
+                           "в параметре content — не пиши во временные файлы. "
+                           "Пиши на русском языке.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -117,21 +124,29 @@ TOOL_DEFS = [
         "function": {
             "name": "submit_changelog_entry",
             "description": "Добавить новую запись в CHANGELOG.md. "
-                           "Запись будет дописана в конец файла. "
-                           "Предыдущие записи не изменятся. "
+                           "Заголовок записи сформируется автоматически. "
                            "Не нужно читать старый CHANGELOG — просто вызови "
-                           "этот инструмент с текстом новой записи.",
+                           "этот инструмент с текстом записи (без заголовка). "
+                           "Если запись для этой пары версий уже существует — "
+                           "вернёт ошибку.",
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "from_ref": {
+                        "type": "string",
+                        "description": "Старый тег (от которого, напр. v0.80.2)",
+                    },
+                    "to_ref": {
+                        "type": "string",
+                        "description": "Новый тег (до которого, напр. v0.80.10)",
+                    },
                     "content": {
                         "type": "string",
                         "description": "Текст новой записи для CHANGELOG.md. "
-                                       "Только новая запись, без заголовка # CHANGELOG "
-                                       "и без старых записей.",
+                                       "Только тело записи, без заголовка ## [...].",
                     },
                 },
-                "required": ["content"],
+                "required": ["from_ref", "to_ref", "content"],
             },
         },
     },
@@ -154,13 +169,24 @@ TOOL_DEFS = [
 ]
 
 
+@dataclass
+class PlannerResult:
+    """Результат работы агента-планировщика с контекстом для последующих фаз."""
+    files_to_update: set[str] = field(default_factory=set)
+    summary_content: str = ""
+    changelog_content: str = ""
+    project_overview: str = ""
+
+
 class DocAgent:
     """Агент управления документацией."""
 
     def __init__(self, state: ProjectState, verbose: bool = False,
-                 log: bool = False) -> None:
+                 log: bool = False, log_file: Optional[str] = None) -> None:
         self.state = state
         self.verbose = verbose
+        self._log_enabled = log
+        self._log_file_path = log_file
 
 
         # Рабочая директория — там, где лежит .docgen.yaml
@@ -171,9 +197,10 @@ class DocAgent:
         # LLM-клиент
         cfg = state.config
         self._generator: Optional[DocGenerator] = None
-        if cfg.llm_api_key:
+        api_key = cfg.llm_api_key or os.environ.get("OPENAI_API_KEY")
+        if api_key:
             self._generator = DocGenerator(
-                api_key=cfg.llm_api_key,
+                api_key=api_key,
                 model=cfg.llm_model,
                 base_url=cfg.llm_base_url,
             )
@@ -201,8 +228,8 @@ class DocAgent:
     ) -> GenerationResult:
         """Создать снэпшот документации.
 
-        Без release_tag — на текущем HEAD. С release_tag — на указанном теге, хэше
-        или ветке (например v1.0, abc1234, main).
+        Без release_tag — на последнем релизном теге. С release_tag — строго на
+        указанном теге (например v1.0.0). Ветки и SHA не поддерживаются.
 
         Копирует все .md-файлы из репозитория в <work_dir>/<hash>/.
         Если check=True, дополнительно запускает аудит.
@@ -216,53 +243,57 @@ class DocAgent:
             t0 = time.monotonic()
 
         if ref:
-            # Фиксированный ref: не фетчим, если уже есть локально
+            # Явно указанное значение должно быть именно Git-тегом.
             ensure_clone(
                 self.state.config.git_repo, self._clone_dir, self._token,
                 verbose=self.verbose,
             )
+            fetch_tags(self._clone_dir, self._token)
+            tags = get_all_tags_with_hash(self._clone_dir)
+            if ref not in tags:
+                raise RefNotFoundError(
+                    f"Релизный тег не найден: {ref}. "
+                    "Ветки и SHA-коммиты не поддерживаются."
+                )
             if self.verbose:
                 self._log(f"  [agent]   ✅ Клон готов ({time.monotonic() - t0:.1f}с)")
             if self.verbose:
                 self._log(f"  [agent]   🔍 Поиск тега {ref}...")
                 t0 = time.monotonic()
-            commit_hash = ensure_ref_available(self._clone_dir, ref)
+            commit_hash = tags[ref]
             if self.verbose:
                 self._log(f"  [agent]   ✅ Тег найден ({time.monotonic() - t0:.1f}с)")
         else:
-            # Без ref — ищем последний релиз через GitHub API, иначе HEAD
+            # Без ref — ищем последний релиз через GitHub API или Git-теги.
             ensure_clone(
                 self.state.config.git_repo, self._clone_dir, self._token,
                 verbose=self.verbose,
             )
+            fetch_tags(self._clone_dir, self._token)
             latest = get_latest_tag(
                 self._clone_dir,
                 github_token=self._token,
                 repo_url=self.state.config.git_repo,
             )
-            if latest:
-                ref = latest
-                if self.verbose:
-                    self._log(f"  [agent]   🔍 Последний релиз: {ref}")
-                    t0 = time.monotonic()
-                commit_hash = ensure_ref_available(self._clone_dir, ref)
-                if self.verbose:
-                    self._log(f"  [agent]   ✅ Ref найден ({time.monotonic() - t0:.1f}с)")
-            else:
-                if self.verbose:
-                    self._log(f"  [agent]   ⏳ Релизов нет — фетчим HEAD...")
-                    t0 = time.monotonic()
-                clone_repo(self.state.config.git_repo, self._clone_dir, self._token)
-                if self.verbose:
-                    self._log(f"  [agent]   ✅ Клон готов ({time.monotonic() - t0:.1f}с)")
-                commit_hash = get_head_hash(self._clone_dir)
+            if not latest:
+                raise DocAgentError(
+                    "В репозитории отсутствуют релизные теги. "
+                    "Создание snapshot остановлено."
+                )
+            ref = latest
+            if self.verbose:
+                self._log(f"  [agent]   🔍 Последний релиз: {ref}")
+                t0 = time.monotonic()
+            commit_hash = ensure_ref_available(self._clone_dir, ref)
+            if self.verbose:
+                self._log(f"  [agent]   ✅ Ref найден ({time.monotonic() - t0:.1f}с)")
 
         if self.verbose:
             label = ref or "HEAD"
             self._log(f"\n  [agent] ▶ Создание снэпшота на {label} → {commit_hash[:8]}")
 
         md_files = scan_md_files(self._clone_dir, treeish=commit_hash)
-        dir_name = ref if ref else commit_hash
+        dir_name = sanitize_tag_name(ref) if ref else commit_hash
         snapshot_dir = os.path.join(self._work_dir, dir_name)
 
         # Копируем все .md
@@ -302,6 +333,7 @@ class DocAgent:
             if self.verbose:
                 self._log(f"\n  [agent] ▶ Полный аудит документации (до {n_audit} ходов)")
             audit = self._full_audit(snapshot_dir, ref=commit_hash, max_turns=n_audit)
+            audit.release_tag = ref
             result = audit
         elif check and not self._generator:
             if self.verbose:
@@ -320,7 +352,7 @@ class DocAgent:
 
         return result
 
-    def watch(self, interval: int, branch: str = "main") -> None:
+    def watch(self, interval: int) -> None:
         """Запустить демон: fetch → обновление → сон."""
         self._log_open("watch")
         if self.verbose:
@@ -333,28 +365,29 @@ class DocAgent:
         if self.verbose:
             self._log(f"  [agent]   ✅ Клон готов ({time.monotonic() - t0:.1f}с)")
         if self.verbose:
-            self._log(f"\n  [agent] ▶ Watch запущен: ветка {branch}, интервал {interval} мин")
+            self._log(f"\n  [agent] ▶ Watch запущен, интервал {interval} мин")
             self._log(f"  [agent]   Рабочая папка: {self._work_dir}")
 
         while True:
             try:
-                self._watch_tick(branch)
+                self._watch_tick()
             except Exception as exc:
                 self._log(f"  [agent]   ⚠ Ошибка: {exc}")
 
             if self.verbose:
                 now = datetime.now().strftime("%H:%M:%S")
-                self._log(f"\n  [agent] 💤 Сон {interval} мин ({now})")
+                self._log(f"\n  [agent] 💤 Сон {interval} мин")
             time.sleep(interval * 60)
 
     # ── Внутренние методы ────────────────────────────────
 
-    def _watch_tick(self, branch: str) -> None:
+    def _watch_tick(self) -> None:
         """Один такт watch: fetch → проверить теги → обновить."""
         if self.verbose:
             self._log(f"  [agent]   ⏳ Fetch тегов {self.state.config.git_repo}...")
             t0 = time.monotonic()
         fetch_repo(self._clone_dir, self._token)
+        fetch_tags(self._clone_dir, self._token)
         if self.verbose:
             self._log(f"  [agent]   ✅ Fetch готов ({time.monotonic() - t0:.1f}с)")
 
@@ -393,8 +426,8 @@ class DocAgent:
         if self.verbose:
             self._log(f"  [agent]   Новый релиз: {old_tag} → {latest_tag}")
 
-        old_snapshot_dir = os.path.join(self._work_dir, old_tag)
-        new_snapshot_dir = os.path.join(self._work_dir, latest_tag)
+        old_snapshot_dir = os.path.join(self._work_dir, sanitize_tag_name(old_tag))
+        new_snapshot_dir = os.path.join(self._work_dir, sanitize_tag_name(latest_tag))
 
         if not os.path.isdir(old_snapshot_dir):
             if self.verbose:
@@ -402,7 +435,7 @@ class DocAgent:
             self.snapshot(release_tag=latest_tag, check=True)
             return
 
-        result = self._update_docs(
+        result, planner_result = self._update_docs(
             old_snapshot_dir=old_snapshot_dir,
             new_snapshot_dir=new_snapshot_dir,
             from_ref=old_tag,
@@ -423,6 +456,9 @@ class DocAgent:
         developer_md_files = [
             f for f in dev_md_proc.stdout.strip().split("\n") if f
         ] if dev_md_proc.returncode == 0 else []
+        # Исключаем служебные файлы из списка изменённых разработчиками
+        _skip_md_files = {"SUMMARY.md", "CHANGELOG.md", "SAMPLE.md", "SAMPLES.md"}
+        developer_md_files = [f for f in developer_md_files if f not in _skip_md_files]
 
         self._ensure_changelog(
             old_tag, latest_tag,
@@ -431,6 +467,7 @@ class DocAgent:
             added_files=result.added_files,
             removed_files=result.removed_files,
             developer_md_files=developer_md_files,
+            planner_result=planner_result,
         )
 
         # Обновляем SUMMARY в соответствии с изменениями
@@ -440,6 +477,7 @@ class DocAgent:
             self._ensure_summary(
                 new_snapshot_dir, ref=latest_tag,
                 max_turns=max(5, self._max_turns),
+                planner_result=planner_result,
             )
 
         # Сохраняем состояние в release-map
@@ -472,7 +510,7 @@ class DocAgent:
         to_ref: str,
         copy_new_from_repo: bool = False,
         max_turns: int = 10,
-    ) -> GenerationResult:
+    ) -> tuple[GenerationResult, PlannerResult]:
         """Инкрементальное обновление документации.
 
         Args:
@@ -482,6 +520,11 @@ class DocAgent:
             to_ref: Git-реф конца.
             copy_new_from_repo: Если True — новые .md копируются из
                 репозитория, а не из старого снэпшота.
+
+        Returns:
+            Кортеж (GenerationResult, PlannerResult).
+            PlannerResult содержит кэшированный контекст для
+            последующих фаз (changelog, summary).
         """
         commit_hash = get_head_hash(self._clone_dir, to_ref)
         result = GenerationResult(commit_hash=commit_hash, output_dir=new_snapshot_dir)
@@ -498,19 +541,38 @@ class DocAgent:
         old_md_files: list[str] = self._scan_snapshot_md(old_snapshot_dir)
         new_repo_md = set(scan_md_files(self._clone_dir, to_ref))
 
+        # ── Предзагрузка SUMMARY.md и CHANGELOG.md ──
+        summary_content = ""
+        if os.path.isfile(self._summary_path):
+            with open(self._summary_path, encoding="utf-8") as f:
+                summary_content = f.read()
+        changelog_content = ""
+        if os.path.isfile(self._changelog_path):
+            with open(self._changelog_path, encoding="utf-8") as f:
+                changelog_content = f.read()
+
         # ── Шаг 3: LLM-маппинг (какие .md обновлять) ──
-        docs_to_update: set[str] = set()
+        planner_result = PlannerResult()
         if self._generator and changed_code:
-            docs_to_update = self._map_changes_to_docs_agentic(
+            planner_result = self._map_changes_to_docs_agentic(
                 changed_code, old_md_files, new_repo_md,
                 from_ref, to_ref, max_turns=max_turns,
+                summary_content=summary_content,
+                changelog_content=changelog_content,
             )
         elif self._generator and not changed_code:
             if self.verbose:
                 self._log(f"  [agent]   Нет изменений кода — ничего не обновляем")
+            # Всё равно передаём кэш для changelog/summary
+            planner_result = PlannerResult(
+                summary_content=summary_content,
+                changelog_content=changelog_content,
+            )
         elif not self._generator:
             if self.verbose:
                 self._log(f"  [agent]   ⚠ LLM не настроен — копируем без изменений")
+
+        docs_to_update = planner_result.files_to_update
 
         # ── Шаг 4: копируем старый снэпшот ──
         # Сначала копируем всё из старого снэпшота
@@ -537,6 +599,8 @@ class DocAgent:
                 p: d for p, d in raw_diffs.items()
                 if self._is_relevant_diff(p, rel_path)
             }
+            if not relevant:
+                relevant = raw_diffs
 
             new_content = self._run_agentic_update(
                 old_doc=old_content,
@@ -545,6 +609,7 @@ class DocAgent:
                 max_turns=max_turns,
                 from_ref=from_ref,
                 to_ref=to_ref,
+                planner_result=planner_result,
             )
             if new_content:
                 dest = Path(new_snapshot_dir) / rel_path
@@ -586,7 +651,7 @@ class DocAgent:
                     self._log(f"  [agent]   🗑 {md_path} (удалён из репозитория)")
         result.docs_removed = removed
 
-        return result
+        return result, planner_result
 
     # ── LLM-маппинг ──────────────────────────────────────
 
@@ -700,18 +765,20 @@ class DocAgent:
         from_ref: str,
         to_ref: str,
         max_turns: int = 10,
-    ) -> set[str]:
+        summary_content: str = "",
+        changelog_content: str = "",
+    ) -> PlannerResult:
         """Агентный цикл: LLM с доступом к терминалу анализирует diff
         и решает, какие .md-файлы требуют обновления.
 
-        Returns:
-            Множество путей .md, которые нужно обновить.
+        Возвращает PlannerResult с путями файлов и контекстом для
+        последующих фаз (воркеры, changelog, summary).
         """
         if not self._generator:
-            return set()
+            return PlannerResult()
         client = self._generator._client
         if not client:
-            return set()
+            return PlannerResult()
 
         max_turns = max(3, max_turns)
 
@@ -735,20 +802,12 @@ class DocAgent:
         system_prompt = (
             "Ты — аналитик документации. Твоя задача — определить, "
             "какие .md-файлы нужно обновить на основе изменений в коде.\n\n"
-            "У тебя есть доступ к терминалу и специальным инструментам:\n"
-            "  • read_summary — прочитать описание проекта (если есть).\n"
-            "    Вызови в самом начале, чтобы быстро понять архитектуру.\n"
-            "  • write_summary — после изучения кода сохрани описание "
-            "проекта для будущих запусков.\n"
-            "  • collect_changelog — собрать список "
-            "изменений между версиями: CHANGELOG'и, подобные им файлы "
-            "и комментарии коммитов.\n"
-            "  • terminal — изучай код, diff'ы, читай файлы.\n\n"
-            "📋 Рекомендуемый порядок:\n"
-            "1. Сначала read_summary — пойми, что за проект.\n"
-            "2. Затем collect_changelog — узнай, "
-            "что изменилось (агент сам найдёт CHANGELOG-подобные файлы).\n"
-            "3. Используй terminal для точечной проверки кода.\n\n"
+            "Контекст проекта уже предоставлен — тебе не нужно вызывать "
+            "read_summary или collect_changelog для получения информации.\n\n"
+            "У тебя есть доступ к терминалу:\n"
+            "  • terminal — текущая папка уже является bare git-"
+            f"репозиторием {self._clone_dir}. Не выполняй cd и не ищи "
+            "рабочую копию; используй git diff, git show и git ls-tree.\n\n"
             "Правила:\n"
             "1. Если изменения кода не затрагивают API, интерфейсы или "
             "описанную функциональность — не обновляй .md.\n"
@@ -758,15 +817,32 @@ class DocAgent:
             "возможно, для них нужна документация.\n"
             "4. Если файл .md удалён из репозитория — не помечай его "
             "как требующий обновления.\n"
-            "5. В конце верни ТОЛЬКО JSON-массив с путями .md-файлов, "
-            "которые нужно обновить. Без пояснений.\n"
-            "6. Пример: [\"docs/guide.md\", \"README.md\"]\n"
-            "7. Если ничего не нужно обновлять: []\n"
+            "5. В конце верни ТОЛЬКО JSON без пояснений в формате:\n"
+            '    {"project_overview": "2-3 предложения о проекте: '
+            'архитектура, ключевые пакеты, назначение",\n'
+            '     "files": ["path/to/file1.md", "path/to/file2.md"]}\n'
+            '6. Пример: {"project_overview": "Проект представляет собой...", '
+            '"files": ["docs/guide.md", "README.md"]}\n'
+            "7. Если ничего не нужно обновлять: "
+            '{"project_overview": "...", "files": []}\n'
             "8. ВАЖНО: у тебя ограниченный бюджет ходов. Не трать всё на "
             "изучение — обязательно оставь 1-2 хода, чтобы выдать "
             "финальный JSON. Если исследуешь diff и .md — делай это "
             "быстро и целенаправленно.\n"
         )
+
+        # Добавляем контекст из SUMMARY и CHANGELOG
+        context_section = ""
+        if summary_content:
+            context_section += (
+                "\n### Содержимое SUMMARY.md\n\n"
+                f"{summary_content[:5000]}\n"
+            )
+        if changelog_content:
+            context_section += (
+                "\n### Содержимое CHANGELOG.md\n\n"
+                f"{changelog_content[:5000]}\n"
+            )
 
         user_prompt = (
             f"### Git diff {from_ref[:8]}..{to_ref[:8]}\n\n"
@@ -776,6 +852,7 @@ class DocAgent:
             f"В старом снэпшоте ({total_md} всего, первые 80):\n{md_sample}\n\n"
             f"Новые .md в репозитории:\n{new_md_text}\n\n"
             f"Удалённые .md из репозитория:\n{deleted_md_text}\n\n"
+            f"{context_section}\n"
             f"Определи, какие .md требуют обновления. "
             f"Используй терминал для изучения кода и diff'ов."
         )
@@ -794,38 +871,58 @@ class DocAgent:
         if not content:
             if self.verbose:
                 self._log(f"  [agent]   ⚠ Агентный маппинг вернул пустой ответ")
-        return set()
+            return PlannerResult(
+                summary_content=summary_content,
+                changelog_content=changelog_content,
+            )
 
-        # Извлекаем JSON из ответа
-        json_match = re.search(r"\[.*?\]", content, re.DOTALL)
-        if json_match:
+        # Извлекаем JSON из ответа — поддерживаем новый формат (объект с overview)
+        # и старый (просто массив)
+        files: set[str] = set()
+        overview = ""
+
+        # Пробуем распарсить как JSON-объект (новый формат)
+        obj_match = re.search(r"\{.*\}", content, re.DOTALL)
+        if obj_match:
             try:
-                paths = json.loads(json_match.group())
-                if isinstance(paths, list):
-                    valid = {p for p in paths if p in old_md_files or p in new_md_files}
-                    if self.verbose:
-                        self._log(f"  [agent]   📋 Агент выбрал: {paths}")
-                        filtered = set(paths) - valid
-                        if filtered:
-                            self._log(f"  [agent]   ⚠ Не найдено в снэпшотах: {sorted(filtered)}")
-                        if valid:
-                            self._log(f"  [agent]   ✏️ Будет обновлено: {sorted(valid)}")
-                        else:
-                            self._log(f"  [agent]   ✓ Ничего не требует обновления")
-                    return valid
-                elif self.verbose:
-                    self._log(f"  [agent]   ⚠ Агент вернул не массив: {paths!r}")
-            except Exception as exc:
-                if self.verbose:
-                    self._log(f"  [agent]   ⚠ Ошибка парсинга ответа: {exc}")
-        elif self.verbose:
-            preview = content[:300].replace("\n", " ")
-            self._log(f"  [agent]   ⚠ Не удалось извлечь JSON из ответа:"
-        f"\"{preview}…\"")
+                data = json.loads(obj_match.group())
+                if isinstance(data, dict):
+                    overview = data.get("project_overview", "") or ""
+                    file_list = data.get("files", [])
+                    if isinstance(file_list, list):
+                        files = {p for p in file_list
+                                 if p in old_md_files or p in new_md_files}
+                elif isinstance(data, list):
+                    # Старый формат — просто массив
+                    files = {p for p in data
+                             if p in old_md_files or p in new_md_files}
+            except Exception:
+                pass
+
+        # Fallback: ищем массив (старый формат "[]")
+        if not files:
+            arr_match = re.search(r"\[.*?\]", content, re.DOTALL)
+            if arr_match:
+                try:
+                    data = json.loads(arr_match.group())
+                    if isinstance(data, list):
+                        files = {p for p in data
+                                 if p in old_md_files or p in new_md_files}
+                except Exception:
+                    pass
 
         if self.verbose:
-            self._log(f"  [agent]   ✓ Ничего не требует обновления (пустой результат)")
-        return set()
+            if files:
+                self._log(f"  [agent]   📋 Агент выбрал: {sorted(files)}")
+            else:
+                self._log(f"  [agent]   ✓ Ничего не требует обновления")
+
+        return PlannerResult(
+            files_to_update=files,
+            summary_content=summary_content,
+            changelog_content=changelog_content,
+            project_overview=overview,
+        )
 
     # ── Инструментальный цикл LLM ─────────────────────────
 
@@ -837,12 +934,17 @@ class DocAgent:
         max_turns: int = 10,
         from_ref: Optional[str] = None,
         to_ref: Optional[str] = None,
+        planner_result: Optional[PlannerResult] = None,
     ) -> Optional[str]:
         """Обновить .md-файл через LLM с доступом к терминалу.
 
         LLM может выполнять команды в репозитории (.clone/), чтобы
         изучить код, проверить структуру, найти зависимости и только
         потом сгенерировать обновлённую документацию.
+
+        Если передан planner_result, воркер получает предварительно
+        загруженный контекст (SUMMARY, CHANGELOG, сводку проекта)
+        и не вызывает read_summary/collect_changelog.
 
         max_turns — сколько ходов (вызовов terminal) даётся агенту.
 
@@ -860,30 +962,49 @@ class DocAgent:
         # Формируем диффы для контекста
         diffs_text = self._format_diffs_for_prompt(code_diffs)
 
+        # Контекст от планировщика (если есть)
+        planner_context = ""
+        if planner_result:
+            if planner_result.project_overview:
+                planner_context += (
+                    f"Сводка проекта:\n{planner_result.project_overview}\n\n"
+                )
+            if planner_result.summary_content:
+                planner_context += (
+                    f"Содержимое SUMMARY.md:\n"
+                    f"{planner_result.summary_content[:3000]}\n\n"
+                )
+            if planner_result.changelog_content:
+                planner_context += (
+                    f"Содержимое CHANGELOG.md:\n"
+                    f"{planner_result.changelog_content[:3000]}\n\n"
+                )
+
         system_prompt = (
-            "Ты — технический писатель с доступом к терминалу и "
-            "специальным инструментам.\n"
+            "Ты — технический писатель с доступом к терминалу.\n"
             "Обновляй .md-файл документации на основе изменений в коде.\n\n"
-            "Инструменты:\n"
-            "  • read_summary — прочитать описание проекта (архитектура, "
-            "модули, соглашения). Вызови в начале, если не знаком с проектом.\n"
-            "  • collect_changelog — понять, какие изменения произошли "
-            "в коде (CHANGELOG'и + коммиты).\n"
-            "  • terminal — выполняй команды в репозитории, чтобы:\n"
+            "Контекст проекта (от планировщика) — не вызывай "
+            "read_summary или collect_changelog:\n"
+            f"{planner_context}"
+            "Доступные инструменты:\n"
+            "  • terminal — текущая папка уже является bare git-"
+            f"репозиторием {self._clone_dir}. Используй git show/diff/"
+            "ls-tree без cd, чтобы:\n"
             "  • Изучить, как устроен изменившийся код\n"
             "  • Проверить экспортируемые функции/классы\n"
             "  • Найти соответствие между diff и документом\n"
             "  • Прочитать README или другие .md для контекста\n\n"
-            "Когда будешь готов — просто напиши обновлённый Markdown-документ "
-            "в ответе. Не вызывай инструмент, если он не нужен — "
-            "вывод сразу считается финальной версией.\n\n"
+            "Когда будешь готов — верни обновлённый Markdown-документ "
+            "строго между отдельными строками DOCGEN_DOCUMENT_START и "
+            "DOCGEN_DOCUMENT_END. Не вызывай инструмент, если он не нужен.\n\n"
             "Правила:\n"
             "1. Сохраняй стиль, структуру и терминологию оригинала.\n"
             "2. Обновляй только разделы, которые затрагивает diff.\n"
             "3. Если изменений нет — верни документ как есть.\n"
             "4. Пиши на русском языке, если не указано иное.\n"
             "5. Верни ПОЛНЫЙ обновлённый Markdown-документ.\n"
-            "6. Напиши рассуждения, а затем — финальную версию.\n"
+            "6. Рассуждения выполняй во внутренних шагах. В финальном "
+            "ответе не добавляй пояснений или вводного текста.\n"
             "7. ВАЖНО: у тебя ограниченный бюджет ходов. Не трать всё на "
             "изучение кода — обязательно оставь 1-2 хода, чтобы выдать "
             "обновлённый документ. Если diff незначительный — можно "
@@ -904,8 +1025,15 @@ class DocAgent:
             {"role": "user", "content": user_prompt},
         ]
 
-        content = self._run_tool_loop(client, messages, file_path, max_turns,
-                                      from_ref=from_ref, to_ref=to_ref)
+        # Воркеру даём только terminal — read_summary/collect_changelog не нужны
+        worker_tools = [t for t in TOOL_DEFS
+                        if t["function"]["name"] == "terminal"]
+        response = self._run_tool_loop(
+            client, messages, file_path, max_turns,
+            from_ref=from_ref, to_ref=to_ref,
+            tools=worker_tools,
+        )
+        content = self._extract_document_response(response)
         if not content or len(content) < 50:
             return old_doc
         return content
@@ -917,7 +1045,11 @@ class DocAgent:
 
         Возвращает stdout (до 8000 символов) или описание ошибки.
         """
-        # Чёрный список опасных команд
+        write_violation = self._terminal_write_violation(command)
+        if write_violation:
+            return f"[ERROR: изменяющая команда заблокирована: {write_violation}]"
+
+        # Дополнительный чёрный список разрушительных команд
         dangerous = [
             r"rm\s.*-rf\s+(/|\*|\.|~)",   # rm -rf /, rm -rf *, rm -rf ., rm -rf ~
             r"rm\s.*\s/(dev|proc|sys|etc|bin)",  # rm ... /dev /proc ...
@@ -941,6 +1073,8 @@ class DocAgent:
                 shell=True,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=30,
                 cwd=self._clone_dir,
             )
@@ -965,6 +1099,34 @@ class DocAgent:
             if self.verbose:
                 self._log(f"  [agent]     ⚠ Ошибка: {exc}")
             return f"[ERROR: {exc}]"
+
+    @staticmethod
+    def _terminal_write_violation(command: str) -> Optional[str]:
+        """Вернуть причину блокировки команды, способной менять состояние."""
+        lowered = command.lower()
+        without_safe_stderr = re.sub(
+            r"2\s*>\s*(?:nul|/dev/null|&1)", "", lowered
+        )
+        if re.search(r"(?:>>?|<)", without_safe_stderr):
+            return "перенаправление ввода/вывода"
+
+        mutating_patterns = [
+            r"(?:^|[;&|]\s*)(?:rm|del|erase|rmdir|rd|mv|move|cp|copy|"
+            r"ren|rename|mkdir|md|touch|tee)\b",
+            r"\b(?:set-content|add-content|out-file|new-item|remove-item|"
+            r"move-item|copy-item|clear-content)\b",
+            r"(?:^|[;&|]\s*)(?:python|python3|py|powershell|pwsh|node|"
+            r"ruby|perl)\b",
+            r"\bgit\s+(?:add|am|apply|checkout|cherry-pick|clean|commit|"
+            r"config(?!\s+--get)|merge|mv|push|rebase|reset|restore|rm|"
+            r"switch|tag)\b",
+            r"\bsed\b[^\r\n]*\s-i(?:\s|$)",
+            r"\b(?:curl|wget|invoke-webrequest|start-bitstransfer)\b",
+        ]
+        for pattern in mutating_patterns:
+            if re.search(pattern, lowered):
+                return "команда записи или запуска интерпретатора"
+        return None
 
     def _format_cmd_line(self, cmd: str) -> list[str]:
         """Отформатировать команду с переносом по ширине терминала."""
@@ -1008,11 +1170,14 @@ class DocAgent:
         max_turns: int = 10,
         from_ref: Optional[str] = None,
         to_ref: Optional[str] = None,
+        tools: Optional[list[dict]] = None,
     ) -> Optional[str]:
         """Выполнить цикл LLM с инструментами.
 
         Возвращает финальный текст ответа или None.
         """
+        if tools is None:
+            tools = TOOL_DEFS
         for turn in range(max_turns):
             if self.verbose:
                 self._log(f"  [agent]     🤖 Ход {turn+1}/{max_turns}: запрос к LLM...")
@@ -1020,7 +1185,7 @@ class DocAgent:
                 resp = client.chat.completions.create(
                     model=self._generator.model,
                     messages=messages,
-                    tools=TOOL_DEFS,
+                    tools=tools,
                     tool_choice="auto",
                     max_tokens=8192,
                     timeout=120,
@@ -1126,13 +1291,37 @@ class DocAgent:
                 elif tc.function.name == "submit_changelog_entry":
                     try:
                         args = json.loads(tc.function.arguments)
+                        from_ref = args.get("from_ref", "")
+                        to_ref = args.get("to_ref", "")
                         content = args.get("content", "")
+                        if not from_ref or not to_ref:
+                            result = "[ERROR: from_ref и to_ref обязательны]"
+                            break
+
+                        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        header_line = f"## [{now_str}] {from_ref} -> {to_ref}"
+
+                        # Проверка на дубликаты
+                        if os.path.isfile(self._changelog_path):
+                            with open(self._changelog_path, encoding="utf-8") as f:
+                                existing = f.read()
+                            marker = f"{from_ref} -> {to_ref}"
+                            if marker in existing:
+                                result = (
+                                    f"[ERROR: запись для {marker} уже существует в "
+                                    f"CHANGELOG.md. Новая запись не добавлена.]"
+                                )
+                                break
+
+                        # Формируем полную запись
+                        entry = f"\n{header_line}\n\n{content.strip()}\n"
+
                         header = "# CHANGELOG документации\n\n"
                         if not os.path.isfile(self._changelog_path):
                             with open(self._changelog_path, "w", encoding="utf-8") as f:
                                 f.write(header)
                         with open(self._changelog_path, "a", encoding="utf-8") as f:
-                            f.write("\n" + content.strip() + "\n")
+                            f.write(entry)
                         result = f"Запись добавлена в CHANGELOG.md ({len(content)} символов)."
                     except (json.JSONDecodeError, KeyError) as exc:
                         result = f"[ERROR: невалидные аргументы: {exc}]"
@@ -1323,11 +1512,14 @@ class DocAgent:
             self._log(f"  [agent]     ✅ Changelog собран ({elapsed:.1f}с)")
         return "\n\n".join(parts) if parts else "[Изменений между ref'ами не найдено]"
 
-    def _ensure_summary(self, snapshot_dir: str, ref: str, max_turns: int = 10) -> None:
+    def _ensure_summary(
+        self, snapshot_dir: str, ref: str, max_turns: int = 10,
+        planner_result: Optional[PlannerResult] = None,
+    ) -> None:
         """Создать или обновить SUMMARY.md, запустив LLM-агента для изучения проекта.
 
-        Вызывается при каждом snapshot. Если SUMMARY.md уже есть — агент
-        читает его, изучает изменения в проекте и обновляет.
+        Если передан planner_result, агент получает кэшированный
+        CHANGELOG и сводку проекта.
 
         Args:
             snapshot_dir: Директория снэпшота (.md-файлы).
@@ -1413,8 +1605,21 @@ class DocAgent:
             "SUMMARY.md.\n"
         )
 
+        # Добавляем кэшированный контекст от планировщика
+        planner_context = ""
+        if planner_result:
+            if planner_result.project_overview:
+                planner_context += (
+                    f"Сводка проекта:\n{planner_result.project_overview}\n\n"
+                )
+            if planner_result.changelog_content:
+                planner_context += (
+                    f"Текущий CHANGELOG.md:\n{planner_result.changelog_content[:3000]}\n\n"
+                )
+
         if old_summary:
             user_prompt = (
+                f"{planner_context}"
                 f"Ранее созданный SUMMARY.md:\n\n{old_summary[:12000]}\n\n"
                 f"Проверь, актуален ли он для версии {ref}. "
                 "Изучи текущую структуру кода "
@@ -1424,6 +1629,7 @@ class DocAgent:
             )
         else:
             user_prompt = (
+                f"{planner_context}"
                 f"Изучи код в репозитории для версии {ref} и создай SUMMARY.md.\n"
                 "Используй terminal для просмотра структуры.\n"
                 f"ВАЖНО: ты в {self._clone_dir} — bare-репозиторий. "
@@ -1449,8 +1655,12 @@ class DocAgent:
         added_files: Optional[list[str]] = None,
         removed_files: Optional[list[str]] = None,
         developer_md_files: Optional[list[str]] = None,
+        planner_result: Optional[PlannerResult] = None,
     ) -> None:
         """Создать или дополнить CHANGELOG.md, запустив LLM-агента.
+
+        Если передан planner_result, агент получает предварительно
+        загруженный контекст SUMMARY и CHANGELOG.
 
         Args:
             old_tag: Старый тег (от которого).
@@ -1469,7 +1679,8 @@ class DocAgent:
             "Ты — редактор CHANGELOG.md. Этот файл содержит историю "
             "изменений только документации анализируемого проекта. "
             "Служебные файлы самого инструмента документирования "
-            "(SUMMARY.md, CHANGELOG.md и т.п.) в него не попадают.\n\n"
+            "(SUMMARY.md, CHANGELOG.md, SAMPLE.md, SAMPLES.md и т.п.) "
+            "в него не попадают. ЗАПРЕЩЕНО упоминать эти файлы в записи.\n\n"
             "Твоя задача — изучить изменения "
             f"между {old_tag} и {latest_tag} и написать новую запись "
             "для CHANGELOG.md.\n\n"
@@ -1483,9 +1694,9 @@ class DocAgent:
             "  • collect_changelog — собрать коммиты и changelog-файлы "
             f"проекта между {old_tag} и {latest_tag}.\n"
             "  • submit_changelog_entry — добавить новую запись "
-            "в CHANGELOG.md. Вызови этот инструмент с текстом новой "
-            "записи. Предыдущие записи не пострадают — заголовок "
-            "добавится автоматически.\n\n"
+            "в CHANGELOG.md. ЗАГОЛОВОК ФОРМИРУЕТСЯ АВТОМАТИЧЕСКИ. "
+            "Передай from_ref, to_ref и content (тело записи без заголовка). "
+            "Предыдущие записи не пострадают.\n\n"
             "Каждая запись содержит две секции:\n"
             "1. Изменения в проекте — на основе коммитов между "
             f"{old_tag} и {latest_tag} (git log, collect_changelog).\n"
@@ -1495,32 +1706,20 @@ class DocAgent:
             "   - Изменено docgen — файлы, которые обработал docgen.\n"
             "   - Изменено разработчиками — файлы, которые "
             "изменили разработчики в git.\n\n"
-            "Формат записи:\n"
-            f"## [{now_str}] {old_tag} -> {latest_tag}\n\n"
-            "### Изменения в проекте\n"
-            "2-5 предложений: ключевые изменения в коде проекта "
-            "(новые фичи, исправления, рефакторинг). "
-            "Бери информацию из коммитов.\n\n"
-            "### Изменения в документации\n"
-            "#### Изменено docgen\n"
-            "- файл.md (кратко: что сделано)\n\n"
-            "#### Изменено разработчиками\n"
-            "- файл.md (кратко: что изменилось)\n\n"
             "Подсекции включай только если есть соответствующие "
             "изменения.\n\n"
-            "ВАЖНЫЕ ПРАВИЛА:\n"
-            "- CHANGELOG.md документирует исключительно изменения "
-            "документации анализируемого проекта. "
-            "Никакой информации о работе инструмента "
-            "документирования (обновлении SUMMARY.md, "
-            "создании/изменении самого CHANGELOG.md или других "
-            "служебных файлов) здесь быть не должно.\n"
-            "- НЕ пиши отдельную запись про работу docgen — "
-            "только одна запись на переход между версиями.\n"
-            "- Пиши на русском языке.\n"
-            "- Факты проверяй через collect_changelog и terminal.\n"
-            "- Сначала изучи изменения, затем вызови "
-            "submit_changelog_entry с готовой записью.\n"
+            "СТРОГИЕ ПРАВИЛА (нарушение недопустимо):\n"
+            "1. ЗАПРЕЩЕНО включать в запись SUMMARY.md, CHANGELOG.md, "
+            "SAMPLE.md, SAMPLES.md или любые другие служебные файлы "
+            "инструмента документирования.\n"
+            "2. ЗАПРЕЩЕНО писать про работу docgen, обновление SUMMARY.md "
+            "или создание/изменение самого CHANGELOG.md.\n"
+            "3. Только одна запись на переход между версиями.\n"
+            "4. Пиши на русском языке.\n"
+            "5. Факты проверяй через collect_changelog и terminal.\n"
+            "6. Сначала изучи изменения, затем вызови "
+            "submit_changelog_entry с from_ref, to_ref и content "
+            "(без заголовка ##).\n"
         )
 
         # Формируем информацию о файлах, обработанных docgen и разработчиками
@@ -1552,6 +1751,16 @@ class DocAgent:
             )
         if dev_info:
             context_parts.append(dev_info)
+        # Добавляем кэшированный контекст от планировщика
+        if planner_result:
+            if planner_result.project_overview:
+                context_parts.append(
+                    f"Сводка проекта:\n{planner_result.project_overview}"
+                )
+            if planner_result.changelog_content:
+                context_parts.append(
+                    f"Текущий CHANGELOG.md:\n{planner_result.changelog_content[:3000]}"
+                )
         context_str = "\n\n".join(context_parts)
 
         instructions = ""
@@ -1602,21 +1811,38 @@ class DocAgent:
     def _log(self, msg: str) -> None:
         """Вывести в консоль (+ в лог-файл, если включено)."""
         if self.verbose:
-            print(msg)
+            try:
+                print(msg, flush=True)
+            except UnicodeEncodeError:
+                stream = sys.stdout
+                reconfigure = getattr(stream, "reconfigure", None)
+                if reconfigure:
+                    reconfigure(encoding="utf-8", errors="replace")
+                    print(msg, flush=True)
+                else:
+                    encoding = getattr(stream, "encoding", None) or "ascii"
+                    safe = msg.encode(encoding, errors="replace").decode(encoding)
+                    print(safe, flush=True)
         if self._log_enabled and self._log_file:
             clean = re.sub(r'\x1b\[[0-9;]*m', '', msg)
             now = datetime.now().strftime("%H:%M:%S")
-            self._log_file.write(f"[{now}] {clean}\n")
+            # Убираем leading \n — оно нужно для консольного форматирования,
+            # но в файл создаёт лишний перенос после [время]
+            self._log_file.write(f"[{now}] {clean.lstrip(chr(10))}\n")
             self._log_file.flush()
 
     def _log_open(self, name: str) -> None:
         """Открыть лог-файл для команды."""
         if not self._log_enabled:
             return
-        log_dir = Path(self._work_dir) / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_path = log_dir / f"{name}_{stamp}.log"
+        if self._log_file_path:
+            log_path = Path(self._log_file_path)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            log_dir = Path(self._work_dir) / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_path = log_dir / f"{name}_{stamp}.log"
         self._log_file = open(log_path, "w", encoding="utf-8")
         self._log(f"  [agent] ▶ Лог открыт: {log_path}")
 
@@ -1735,8 +1961,10 @@ class DocAgent:
             "4. Пиши на русском языке.\n"
             "5. Не добавляй разделы, которых нет.\n"
             "6. Верни ПОЛНЫЙ документ, не только изменения.\n"
-            "7. После анализа напиши свои рассуждения, а затем — "
-            "финальную версию документа.\n"
+            "7. Рассуждения выполняй во внутренних шагах. В финальном "
+            "ответе не добавляй пояснений, оценок и вводного текста. "
+            "Верни документ строго между отдельными строками "
+            "DOCGEN_DOCUMENT_START и DOCGEN_DOCUMENT_END.\n"
             "8. ВАЖНО: у тебя ограниченный бюджет ходов. Если файл "
             "заведомо актуален или изменения тривиальны — сразу верни "
             "его как есть, не тратя ходы на изучение.\n"
@@ -1755,7 +1983,8 @@ class DocAgent:
             {"role": "user", "content": user_prompt},
         ]
 
-        content = self._run_tool_loop(client, messages, file_path, max_turns)
+        response = self._run_tool_loop(client, messages, file_path, max_turns)
+        content = self._extract_document_response(response, allow_deleted=True)
 
         # Если LLM сказала DELETED или ответ пустой — не трогаем
         if not content or content == "DELETED":
@@ -1767,6 +1996,35 @@ class DocAgent:
 
         return content
 
+    def _extract_document_response(
+        self,
+        response: Optional[str],
+        *,
+        allow_deleted: bool = False,
+    ) -> Optional[str]:
+        """Извлечь только Markdown-документ из финального ответа LLM."""
+        if not response:
+            return None
+
+        stripped = response.strip()
+        if allow_deleted and stripped == "DELETED":
+            return stripped
+
+        start_marker = "DOCGEN_DOCUMENT_START"
+        end_marker = "DOCGEN_DOCUMENT_END"
+        start = stripped.find(start_marker)
+        end = stripped.find(end_marker, start + len(start_marker))
+        if start < 0 or end < 0:
+            if self.verbose:
+                self._log(
+                    "  [agent]     ⚠ Ответ аудита отклонён: "
+                    "нет маркеров документа"
+                )
+            return None
+
+        document = stripped[start + len(start_marker):end].strip()
+        return document or None
+
     # ── Хелперы ──────────────────────────────────────────
 
     @staticmethod
@@ -1777,7 +2035,7 @@ class DocAgent:
             return []
         files: list[str] = []
         for f in sorted(root.rglob("*.md")):
-            rel = str(f.relative_to(root))
+            rel = f.relative_to(root).as_posix()
             files.append(rel)
         return files
 

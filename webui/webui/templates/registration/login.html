@@ -1,0 +1,13 @@
+{% extends "webui/base.html" %}
+{% block title %}Вход · Docgen{% endblock %}
+{% block content %}
+<section class="auth-card card">
+  <p class="eyebrow">DOCGEN CONTROL CENTER</p>
+  <h1>Вход в систему</h1>
+  <p class="muted">Используйте учётную запись офисного сервера документации.</p>
+  <form method="post" class="stack">{% csrf_token %}
+    {{ form.as_p }}
+    <button class="button primary" type="submit">Войти</button>
+  </form>
+</section>
+{% endblock %}

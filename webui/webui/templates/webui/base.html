@@ -1,0 +1,29 @@
+{% load static %}
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Docgen{% endblock %}</title>
+  <link rel="stylesheet" href="{% static 'webui/app.css' %}">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="{% url 'dashboard' %}">docgen</a>
+    {% if user.is_authenticated %}
+      <nav>
+        <span>{{ user.get_username }}</span>
+        <a href="{% url 'user-guide' %}">Руководство</a>
+        {% if user.is_staff %}<a href="{% url 'system-settings' %}">Настройки</a><a href="{% url 'admin:index' %}">Django Admin</a>{% endif %}
+        <form action="{% url 'logout' %}" method="post">{% csrf_token %}<button class="link-button">Выйти</button></form>
+      </nav>
+    {% endif %}
+  </header>
+  <main class="container">
+    {% for message in messages %}<div class="notice {{ message.tags }}">{{ message }}</div>{% endfor %}
+    {% block content %}{% endblock %}
+  </main>
+  {% block scripts %}{% endblock %}
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+</body>
+</html>
