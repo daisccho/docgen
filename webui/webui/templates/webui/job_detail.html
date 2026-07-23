@@ -96,8 +96,9 @@
 
   // ── скролл ──
   function scrollToBottom() {
-    if (output && autoScroll) {
-      output.scrollTop = output.scrollHeight;
+    const container = document.getElementById('term-body');
+    if (container && autoScroll) {
+      container.scrollTop = container.scrollHeight;
     }
   }
 

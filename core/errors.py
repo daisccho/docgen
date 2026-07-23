@@ -11,3 +11,7 @@ class NotGitRepositoryError(DocAgentError):
 
 class RefNotFoundError(DocAgentError):
     """Запрашиваемый ref не найден."""
+
+
+class RateLimitError(DocAgentError):
+    """Исчерпан лимит запросов к LLM-провайдеру."""

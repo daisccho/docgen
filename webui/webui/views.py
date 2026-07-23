@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import yaml
+
 from django.contrib import messages
 from django.contrib.admin.views.decorators import staff_member_required
 from django.contrib.auth.decorators import login_required
@@ -88,6 +90,18 @@ def project_detail(request: HttpRequest, slug: str) -> HttpResponse:
     watch_active = project.jobs.filter(
         kind=Job.Kind.WATCH, status__in=[Job.Status.QUEUED, Job.Status.RUNNING]
     ).exists()
+
+    # Проверка чекпойнта для возобновления
+    checkpoint = None
+    cp_path = project.workspace_path / ".docgen-resume.yaml"
+    if cp_path.is_file():
+        try:
+            checkpoint = yaml.safe_load(cp_path.read_text(encoding="utf-8"))
+            if not isinstance(checkpoint, dict):
+                checkpoint = None
+        except Exception:
+            checkpoint = None
+
     return render(
         request,
         "webui/project_detail.html",
@@ -99,6 +113,7 @@ def project_detail(request: HttpRequest, slug: str) -> HttpResponse:
             "init_label": init_label,
             "watch_active": watch_active,
             "common": GlobalSettings.load(),
+            "checkpoint": checkpoint,
         },
     )
 
@@ -145,6 +160,23 @@ def reinit_project(request: HttpRequest, slug: str) -> HttpResponse:
 def watch_create(request: HttpRequest, slug: str) -> HttpResponse:
     """Запустить режим наблюдения (watch)."""
     project = get_object_or_404(Project, slug=slug)
+
+    # Проверка блокирующего чекпойнта
+    cp_path = project.workspace_path / ".docgen-resume.yaml"
+    if cp_path.is_file():
+        try:
+            cp = yaml.safe_load(cp_path.read_text(encoding="utf-8"))
+            if isinstance(cp, dict) and cp.get("command") != "watch":
+                messages.error(
+                    request,
+                    "Невозможно запустить watch: обнаружен незавершённый процесс "
+                    f"'{cp.get('command')}'. "
+                    "Завершите его или удалите .docgen-resume.yaml вручную."
+                )
+                return redirect(project)
+        except Exception:
+            pass
+
     if project.jobs.filter(
         kind=Job.Kind.WATCH, status__in=[Job.Status.QUEUED, Job.Status.RUNNING]
     ).exists():
@@ -188,6 +220,23 @@ def watch_create(request: HttpRequest, slug: str) -> HttpResponse:
 @require_POST
 def snapshot_create(request: HttpRequest, slug: str) -> HttpResponse:
     project = get_object_or_404(Project, slug=slug)
+
+    # Проверка блокирующего чекпойнта
+    cp_path = project.workspace_path / ".docgen-resume.yaml"
+    if cp_path.is_file():
+        try:
+            cp = yaml.safe_load(cp_path.read_text(encoding="utf-8"))
+            if isinstance(cp, dict) and cp.get("command") != "snapshot":
+                messages.error(
+                    request,
+                    "Невозможно создать snapshot: обнаружен незавершённый процесс "
+                    f"'{cp.get('command')}'. "
+                    "Завершите его или удалите .docgen-resume.yaml вручную."
+                )
+                return redirect(project)
+        except Exception:
+            pass
+
     if not (project.workspace_path / ".docgen.yaml").is_file():
         messages.error(request, "Сначала дождитесь завершения инициализации проекта.")
         return redirect(project)

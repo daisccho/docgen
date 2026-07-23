@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import time
+import yaml
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +21,7 @@ from core.config import (
     save_state,
 )
 from core.doc_generator import DocGenerator
-from core.errors import DocAgentError, RefNotFoundError
+from core.errors import DocAgentError, RateLimitError, RefNotFoundError
 from core.git_analyzer import (
     ensure_clone,
     ensure_ref_available,
@@ -41,6 +42,7 @@ from core.git_analyzer import (
 )
 from core.models import GenerationResult, ProjectState
 
+CHECKPOINT_FILENAME = ".docgen-resume.yaml"
 CLONE_DIR = ".clone"
 
 # Определение инструментов LLM
@@ -217,6 +219,214 @@ class DocAgent:
         self._log_file: Optional[Any] = None
         self._summary_path = os.path.join(self._work_dir, "SUMMARY.md")
         self._changelog_path = os.path.join(self._work_dir, "CHANGELOG.md")
+        self._resuming = False
+
+# ── Чекпойнт и возобновление ─────────────────────────
+
+    @staticmethod
+    def _is_rate_limit_error(exc: Exception) -> bool:
+        """Определить, является ли ошибка исчерпанием лимитов LLM."""
+        err_msg = str(exc).lower()
+        keywords = [
+            "rate limit", "quota", "limit exceeded", "credits",
+            "daily limit", "insufficient", "upstream request failed",
+            "429", "too many requests",
+        ]
+        return any(kw in err_msg for kw in keywords)
+
+    def _checkpoint_path(self) -> str:
+        """Путь к файлу чекпойнта."""
+        return os.path.join(self._work_dir, CHECKPOINT_FILENAME)
+
+    def _save_checkpoint(
+        self,
+        *,
+        phase: str,
+        command: str = "watch",
+        from_ref: Optional[str] = None,
+        to_ref: Optional[str] = None,
+        completed_files: Optional[list[str]] = None,
+        release_tag: Optional[str] = None,
+        is_check: bool = False,
+    ) -> None:
+        """Сохранить чекпойнт для возобновления."""
+        data: dict[str, Any] = {
+            "command": command,
+            "phase": phase,
+            "completed_files": completed_files or [],
+            "log_file": self._log_file_path or "",
+            "timestamp": datetime.now().isoformat(),
+        }
+        if command == "watch":
+            data["from_ref"] = from_ref
+            data["to_ref"] = to_ref
+        elif command == "snapshot":
+            data["release_tag"] = release_tag
+            data["is_check"] = is_check
+        path = self._checkpoint_path()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
+            if self.verbose:
+                self._log(f"  [agent]   💾 Чекпойнт сохранён: {path}")
+        except Exception as exc:
+            if self.verbose:
+                self._log(f"  [agent]   ⚠ Не удалось сохранить чекпойнт: {exc}")
+
+    def _load_checkpoint(self) -> Optional[dict[str, Any]]:
+        """Загрузить чекпойнт, если существует."""
+        path = self._checkpoint_path()
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+            if not isinstance(data, dict):
+                return None
+            return data
+        except Exception:
+            return None
+
+    def _clear_checkpoint(self) -> None:
+        """Удалить чекпойнт."""
+        path = self._checkpoint_path()
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+                if self.verbose:
+                    self._log(f"  [agent]   ✅ Чекпойнт удалён")
+        except Exception as exc:
+            if self.verbose:
+                self._log(f"  [agent]   ⚠ Не удалось удалить чекпойнт: {exc}")
+
+    def _resume_watch(self, checkpoint: dict[str, Any]) -> None:
+        """Продолжить прерванный watch из чекпойнта."""
+        from_ref = checkpoint.get("from_ref", "")
+        to_ref = checkpoint.get("to_ref", "")
+        phase = checkpoint.get("phase", "update_docs")
+        completed = checkpoint.get("completed_files", [])
+
+        self._log(f"  [agent]   ▶ Продолжение watch: {from_ref} → {to_ref}, фаза: {phase}")
+
+        try:
+            if phase == "update_docs" or phase == "changelog":
+                old_snapshot_dir = os.path.join(
+                    self._work_dir, sanitize_tag_name(from_ref)
+                )
+                new_snapshot_dir = os.path.join(
+                    self._work_dir, sanitize_tag_name(to_ref)
+                )
+                if not os.path.isdir(new_snapshot_dir):
+                    os.makedirs(new_snapshot_dir, exist_ok=True)
+
+                if phase == "update_docs":
+                    self._update_docs(
+                        old_snapshot_dir=old_snapshot_dir,
+                        new_snapshot_dir=new_snapshot_dir,
+                        from_ref=from_ref,
+                        to_ref=to_ref,
+                        copy_new_from_repo=True,
+                        skip_files=completed,
+                    )
+
+                self._ensure_changelog(
+                    old_tag=from_ref,
+                    latest_tag=to_ref,
+                    updated_files=None,
+                    added_files=None,
+                    removed_files=None,
+                )
+
+            if phase in ("update_docs", "changelog", "summary"):
+                old_snapshot_dir = os.path.join(
+                    self._work_dir, sanitize_tag_name(from_ref)
+                )
+                new_snapshot_dir = os.path.join(
+                    self._work_dir, sanitize_tag_name(to_ref)
+                )
+                self._ensure_summary(
+                    snapshot_dir=new_snapshot_dir,
+                    ref=to_ref,
+                )
+
+            # Сохраняем release_map
+            release_map = load_release_map()
+            release_map.last_documented_release = to_ref
+            save_release_map(release_map)
+            self._clear_checkpoint()
+            self._log("✅ Прерванный watch успешно завершён")
+
+        except RateLimitError:
+            # Повторный рейт-лимит — обновляем чекпойнт
+            new_completed = completed
+            if phase == "update_docs":
+                new_completed = completed
+            self._save_checkpoint(
+                command="watch",
+                phase=phase,
+                from_ref=from_ref,
+                to_ref=to_ref,
+                completed_files=new_completed,
+            )
+            self._log("⚠ Повторный рейт-лимит — запустите watch ещё раз позже")
+
+    def _resume_snapshot(self, checkpoint: dict[str, Any]) -> GenerationResult:
+        """Продолжить прерванный snapshot из чекпойнта."""
+        release_tag = checkpoint.get("release_tag", "")
+        phase = checkpoint.get("phase", "summary")
+        is_check = checkpoint.get("is_check", False)
+        completed = checkpoint.get("completed_files", [])
+
+        self._log(f"  [agent]   ▶ Продолжение snapshot: {release_tag}, фаза: {phase}")
+
+        # Определяем директорию снэпшота
+        snapshot_dir = os.path.join(self._work_dir, sanitize_tag_name(release_tag))
+
+        # Если снэпшот-директории нет — создаём (безопасно повторять)
+        if not os.path.isdir(snapshot_dir):
+            os.makedirs(snapshot_dir, exist_ok=True)
+
+        result = GenerationResult(
+            commit_hash=release_tag,
+            output_dir=snapshot_dir,
+        )
+
+        try:
+            if phase == "summary":
+                self._ensure_summary(
+                    snapshot_dir=snapshot_dir,
+                    ref=release_tag,
+                )
+
+            if phase in ("summary", "full_audit") and is_check:
+                audit = self._full_audit(
+                    snapshot_dir=snapshot_dir,
+                    ref=release_tag,
+                    skip_files=completed,
+                )
+                result.docs_updated = audit.docs_updated
+                result.docs_copied = audit.docs_copied
+
+            if phase == "full_audit" and not is_check:
+                pass
+
+            self._clear_checkpoint()
+            self._log("✅ Прерванный snapshot успешно завершён")
+            return result
+
+        except RateLimitError:
+            new_completed = completed
+            if phase == "full_audit":
+                new_completed = completed
+            self._save_checkpoint(
+                command="snapshot",
+                phase=phase,
+                release_tag=release_tag,
+                is_check=is_check,
+                completed_files=new_completed,
+            )
+            self._log("⚠ Повторный рейт-лимит — запустите snapshot ещё раз позже")
+            return result
 
     # ── Открытые методы ─────────────────────────────────
 
@@ -235,6 +445,19 @@ class DocAgent:
         Если check=True, дополнительно запускает аудит.
         """
         self._log_open("snapshot")
+
+        # Проверка чекпойнта для возобновления
+        checkpoint = self._load_checkpoint()
+        if checkpoint and checkpoint.get("command") == "snapshot":
+            cp_tag = checkpoint.get("release_tag")
+            target_tag = release_tag or None
+            if cp_tag == target_tag:
+                self._log(
+                    f"Обнаружен прерванный snapshot для {cp_tag} — продолжаю..."
+                )
+                self._resuming = True
+                return self._resume_snapshot(checkpoint)
+
         ref = release_tag
 
         # ── Клон: создать или открыть ──
@@ -326,13 +549,31 @@ class DocAgent:
             if self.verbose:
                 label = "Создание" if not os.path.isfile(self._summary_path) else "Обновление"
                 self._log(f"\n  [agent] ▶ {label} SUMMARY.md (до {n_summary} ходов)")
-            self._ensure_summary(snapshot_dir, ref=commit_hash, max_turns=n_summary)
+            try:
+                self._ensure_summary(snapshot_dir, ref=commit_hash, max_turns=n_summary)
+            except RateLimitError:
+                self._save_checkpoint(
+                    phase="summary",
+                    command="snapshot",
+                    release_tag=ref,
+                    is_check=check,
+                )
+                raise
 
         if check and self._generator:
             n_audit = max_turns if max_turns is not None else self._max_turns
             if self.verbose:
                 self._log(f"\n  [agent] ▶ Полный аудит документации (до {n_audit} ходов)")
-            audit = self._full_audit(snapshot_dir, ref=commit_hash, max_turns=n_audit)
+            try:
+                audit = self._full_audit(snapshot_dir, ref=commit_hash, max_turns=n_audit)
+            except RateLimitError:
+                self._save_checkpoint(
+                    phase="full_audit",
+                    command="snapshot",
+                    release_tag=ref,
+                    is_check=check,
+                )
+                raise
             audit.release_tag = ref
             result = audit
         elif check and not self._generator:
@@ -355,6 +596,15 @@ class DocAgent:
     def watch(self, interval: int) -> None:
         """Запустить демон: fetch → обновление → сон."""
         self._log_open("watch")
+
+        # Проверка чекпойнта для возобновления
+        checkpoint = self._load_checkpoint()
+        if checkpoint and checkpoint.get("command") == "watch":
+            self._log("Обнаружен прерванный процесс watch — продолжаю...")
+            self._resuming = True
+            self._resume_watch(checkpoint)
+            return
+
         if self.verbose:
             self._log(f"  [agent]   ⏳ Открытие {self.state.config.git_repo}...")
             t0 = time.monotonic()
@@ -371,6 +621,10 @@ class DocAgent:
         while True:
             try:
                 self._watch_tick()
+            except RateLimitError:
+                self._log("⚠ Достигнут лимит LLM — прогресс сохранён")
+                self._log("Для продолжения запустите watch повторно")
+                break
             except Exception as exc:
                 self._log(f"  [agent]   ⚠ Ошибка: {exc}")
 
@@ -472,25 +726,43 @@ class DocAgent:
         _skip_md_files = {"SUMMARY.md", "CHANGELOG.md", "SAMPLE.md", "SAMPLES.md"}
         developer_md_files = [f for f in developer_md_files if f not in _skip_md_files]
 
-        self._ensure_changelog(
-            old_tag, latest_tag,
-            max_turns=self._max_turns,
-            updated_files=result.updated_files,
-            added_files=result.added_files,
-            removed_files=result.removed_files,
-            developer_md_files=developer_md_files,
-            planner_result=planner_result,
-        )
+        try:
+            self._ensure_changelog(
+                old_tag, latest_tag,
+                max_turns=self._max_turns,
+                updated_files=result.updated_files,
+                added_files=result.added_files,
+                removed_files=result.removed_files,
+                developer_md_files=developer_md_files,
+                planner_result=planner_result,
+            )
+        except RateLimitError:
+            self._save_checkpoint(
+                phase="changelog",
+                command="watch",
+                from_ref=old_tag,
+                to_ref=latest_tag,
+            )
+            raise
 
         # Обновляем SUMMARY в соответствии с изменениями
         if self._generator and self.verbose:
             self._log(f"\n  [agent] ▶ Обновление SUMMARY.md для {latest_tag}")
-        if self._generator:
-            self._ensure_summary(
-                new_snapshot_dir, ref=latest_tag,
-                max_turns=max(5, self._max_turns),
-                planner_result=planner_result,
+        try:
+            if self._generator:
+                self._ensure_summary(
+                    new_snapshot_dir, ref=latest_tag,
+                    max_turns=max(5, self._max_turns),
+                    planner_result=planner_result,
+                )
+        except RateLimitError:
+            self._save_checkpoint(
+                phase="summary",
+                command="watch",
+                from_ref=old_tag,
+                to_ref=latest_tag,
             )
+            raise
 
         # Сохраняем состояние в release-map
         release_map = load_release_map()
@@ -522,6 +794,7 @@ class DocAgent:
         to_ref: str,
         copy_new_from_repo: bool = False,
         max_turns: int = 10,
+        skip_files: Optional[list[str]] = None,
     ) -> tuple[GenerationResult, PlannerResult]:
         """Инкрементальное обновление документации.
 
@@ -586,6 +859,13 @@ class DocAgent:
 
         docs_to_update = planner_result.files_to_update
 
+        # Пропускаем уже обработанные файлы (при возобновлении)
+        skip_set = set(skip_files or [])
+        if skip_set:
+            docs_to_update = [d for d in docs_to_update if d not in skip_set]
+            if self.verbose:
+                self._log(f"  [agent]   Пропущено {len(skip_set)} уже обработанных файлов")
+
         # ── Шаг 4: копируем старый снэпшот ──
         # Сначала копируем всё из старого снэпшота
         self._copy_snapshot(old_snapshot_dir, new_snapshot_dir)
@@ -618,15 +898,26 @@ class DocAgent:
             if not relevant:
                 relevant = raw_diffs
 
-            new_content = self._run_agentic_update(
-                old_doc=old_content,
-                code_diffs=relevant,
-                file_path=rel_path,
-                max_turns=max_turns,
-                from_ref=from_ref,
-                to_ref=to_ref,
-                planner_result=planner_result,
-            )
+            try:
+                new_content = self._run_agentic_update(
+                    old_doc=old_content,
+                    code_diffs=relevant,
+                    file_path=rel_path,
+                    max_turns=max_turns,
+                    from_ref=from_ref,
+                    to_ref=to_ref,
+                    planner_result=planner_result,
+                )
+            except RateLimitError:
+                completed_so_far = docs_to_update[:docs_to_update.index(rel_path)]
+                self._save_checkpoint(
+                    phase="update_docs",
+                    command="watch",
+                    from_ref=from_ref,
+                    to_ref=to_ref,
+                    completed_files=completed_so_far,
+                )
+                raise
             if new_content:
                 dest = Path(new_snapshot_dir) / rel_path
                 dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1216,6 +1507,8 @@ class DocAgent:
             except Exception as exc:
                 if self.verbose:
                     self._log(f"  [agent]     ⚠ LLM ошибка: {exc}")
+                if self._is_rate_limit_error(exc):
+                    raise RateLimitError(str(exc)) from exc
                 return None
 
             msg = resp.choices[0].message
@@ -1866,7 +2159,8 @@ class DocAgent:
             log_dir.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             log_path = log_dir / f"{name}_{stamp}.log"
-        self._log_file = open(log_path, "w", encoding="utf-8")
+        mode = "a" if self._resuming else "w"
+        self._log_file = open(log_path, mode, encoding="utf-8")
         self._log(f"  [agent] ▶ Лог открыт: {log_path}")
 
     def _log_close(self) -> None:
@@ -1878,18 +2172,27 @@ class DocAgent:
     # ── Полный аудит (snapshot -c) ──────────────────────
 
 
-    def _full_audit(self, snapshot_dir: str, ref: str, max_turns: int = 10) -> GenerationResult:
+    def _full_audit(
+        self, snapshot_dir: str, ref: str, max_turns: int = 10,
+        skip_files: Optional[list[str]] = None,
+    ) -> GenerationResult:
         """Полный аудит всех .md на соответствие коду указанной версии.
 
         Args:
             snapshot_dir: Директория снэпшота (.md-файлы).
             ref: Git-реф (хэш коммита), для которого проверяется документация.
             max_turns: Максимум ходов агента на один .md файл.
+            skip_files: Список файлов, которые уже обработаны (возобновление).
 
         Returns:
             GenerationResult
         """
         md_files = self._scan_snapshot_md(snapshot_dir)
+        # Пропускаем уже обработанные файлы
+        skip_set = set(skip_files or [])
+        if skip_set:
+            md_files = [f for f in md_files if f not in skip_set]
+
         commit_hash = ref
         result = GenerationResult(
             commit_hash=commit_hash,
@@ -1897,6 +2200,8 @@ class DocAgent:
         )
 
         if self.verbose:
+            if skip_set:
+                self._log(f"  [agent]   Пропущено {len(skip_set)} уже проверенных файлов")
             self._log(f"\n  [agent]   Всего .md для аудита: {len(md_files)}")
 
         updated = 0
@@ -1909,12 +2214,25 @@ class DocAgent:
             if not old_content:
                 continue
 
-            new_content = self._run_agentic_audit(
-                old_doc=old_content,
-                file_path=rel_path,
-                ref=commit_hash,
-                max_turns=max_turns,
-            )
+            try:
+                new_content = self._run_agentic_audit(
+                    old_doc=old_content,
+                    file_path=rel_path,
+                    ref=commit_hash,
+                    max_turns=max_turns,
+                )
+            except RateLimitError:
+                completed_so_far = md_files[:md_files.index(rel_path)]
+                # Добавляем ранее пропущенные файлы к completed
+                total_completed = list(skip_set) + completed_so_far
+                self._save_checkpoint(
+                    phase="full_audit",
+                    command="snapshot",
+                    release_tag=ref,
+                    is_check=True,
+                    completed_files=total_completed,
+                )
+                raise
 
             if new_content and new_content != old_content:
                 dest = Path(snapshot_dir) / rel_path

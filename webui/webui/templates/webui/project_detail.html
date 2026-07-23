@@ -25,44 +25,90 @@
 
 <div class="split">
   <section class="card form-card">
-    <h2>Создать snapshot</h2>
-    <form method="post" action="{% url 'snapshot-create' project.slug %}" class="stack">
-      {% csrf_token %}
-      <p>
-        <label for="release">Тег релиза <span class="muted">(пусто = последний релиз)</span></label>
-        <input id="release" name="release" placeholder="v1.0.0 или release-2026-07">
-      </p>
-      <p class="muted">Docgen работает только с релизными Git-тегами. Если тегов нет, snapshot не создаётся.</p>
-      <label class="check"><input type="checkbox" name="check"> Выполнить полный LLM-аудит</label>
-      <button class="button primary" {% if init_status != "succeeded" %}disabled{% endif %}>
-        Поставить в очередь
-      </button>
-    </form>
-
-    <hr class="section-divider">
-    <h2>Режим наблюдения</h2>
-    <div style="display:flex;gap:8px">
-      <form method="post" action="{% url 'watch-create' project.slug %}" style="flex:1">
-        {% csrf_token %}
-        <button class="button primary"
-          style="width:100%;justify-content:center"
-          {% if init_status != "succeeded" or watch_active %}disabled{% endif %}>
-          {% if watch_active %}Наблюдение запущено{% else %}Запустить режим наблюдения{% endif %}
-        </button>
-      </form>
-      {% if watch_active %}
-        <a href="{% url 'watch-monitor' project.slug %}" class="button"
-          style="font-size:16px;display:inline-flex;align-items:center;justify-content:center;min-width:42px"
-          title="Открыть монитор наблюдения">👁</a>
-        <form method="post" action="{% url 'watch-stop' project.slug %}"
-          style="margin:0;padding:0"
-          onsubmit="return confirm('Остановить наблюдение?')">
+    {% if checkpoint %}
+      {% if checkpoint.command == "snapshot" %}
+        <h2>▶ Продолжить генерацию снапшота</h2>
+        <form method="post" action="{% url 'snapshot-create' project.slug %}" class="stack">
           {% csrf_token %}
-          <button class="button danger" title="Остановить наблюдение"
-            style="font-size:16px;display:inline-flex;align-items:center;justify-content:center;min-width:42px">⏹</button>
+          <input type="hidden" name="release" value="{{ checkpoint.release_tag|default:'' }}">
+          <p class="muted">Обнаружен прерванный snapshot для тега <strong>{{ checkpoint.release_tag }}</strong>.
+          Фаза: {{ checkpoint.phase }}. Нажмите «Продолжить», чтобы возобновить генерацию.</p>
+          <button class="button primary" style="width:100%;justify-content:center">
+            ▶ Продолжить генерацию снапшота
+          </button>
+        </form>
+        <hr class="section-divider">
+        <h2>Режим наблюдения</h2>
+        <button class="button" style="width:100%;justify-content:center" disabled
+          title="Недоступно: обнаружен незавершённый snapshot. Завершите его или удалите .docgen-resume.yaml.">
+          Запустить режим наблюдения (недоступно)
+        </button>
+      {% elif checkpoint.command == "watch" %}
+        <h2>Создать snapshot</h2>
+        <form method="post" action="{% url 'snapshot-create' project.slug %}" class="stack">
+          {% csrf_token %}
+          <p>
+            <label for="release">Тег релиза <span class="muted">(пусто = последний релиз)</span></label>
+            <input id="release" name="release" placeholder="v1.0.0 или release-2026-07">
+          </p>
+          <p class="muted">Docgen работает только с релизными Git-тегами. Если тегов нет, snapshot не создаётся.</p>
+          <label class="check"><input type="checkbox" name="check"> Выполнить полный LLM-аудит</label>
+          <button class="button" style="width:100%;justify-content:center" disabled
+            title="Недоступно: обнаружен незавершённый watch. Завершите его или удалите .docgen-resume.yaml.">
+            Создать snapshot (недоступно)
+          </button>
+        </form>
+        <hr class="section-divider">
+        <h2>▶ Продолжить режим наблюдения</h2>
+        <form method="post" action="{% url 'watch-create' project.slug %}">
+          {% csrf_token %}
+          <p class="muted">Обнаружен прерванный watch ({{ checkpoint.from_ref }} → {{ checkpoint.to_ref }}).
+          Фаза: {{ checkpoint.phase }}. Нажмите «Продолжить», чтобы возобновить.</p>
+          <button class="button primary" style="width:100%;justify-content:center">
+            ▶ Продолжить режим наблюдения
+          </button>
         </form>
       {% endif %}
-    </div>
+    {% else %}
+      <h2>Создать snapshot</h2>
+      <form method="post" action="{% url 'snapshot-create' project.slug %}" class="stack">
+        {% csrf_token %}
+        <p>
+          <label for="release">Тег релиза <span class="muted">(пусто = последний релиз)</span></label>
+          <input id="release" name="release" placeholder="v1.0.0 или release-2026-07">
+        </p>
+        <p class="muted">Docgen работает только с релизными Git-тегами. Если тегов нет, snapshot не создаётся.</p>
+        <label class="check"><input type="checkbox" name="check"> Выполнить полный LLM-аудит</label>
+        <button class="button primary" {% if init_status != "succeeded" %}disabled{% endif %}>
+          Поставить в очередь
+        </button>
+      </form>
+
+      <hr class="section-divider">
+      <h2>Режим наблюдения</h2>
+      <div style="display:flex;gap:8px">
+        <form method="post" action="{% url 'watch-create' project.slug %}" style="flex:1">
+          {% csrf_token %}
+          <button class="button primary"
+            style="width:100%;justify-content:center"
+            {% if init_status != "succeeded" or watch_active %}disabled{% endif %}>
+            {% if watch_active %}Наблюдение запущено{% else %}Запустить режим наблюдения{% endif %}
+          </button>
+        </form>
+        {% if watch_active %}
+          <a href="{% url 'watch-monitor' project.slug %}" class="button"
+            style="font-size:16px;display:inline-flex;align-items:center;justify-content:center;min-width:42px"
+            title="Открыть монитор наблюдения">👁</a>
+          <form method="post" action="{% url 'watch-stop' project.slug %}"
+            style="margin:0;padding:0"
+            onsubmit="return confirm('Остановить наблюдение?')">
+            {% csrf_token %}
+            <button class="button danger" title="Остановить наблюдение"
+              style="font-size:16px;display:inline-flex;align-items:center;justify-content:center;min-width:42px">⏹</button>
+          </form>
+        {% endif %}
+      </div>
+    {% endif %}
   </section>
 
   <section class="card facts">

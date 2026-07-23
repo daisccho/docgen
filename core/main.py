@@ -183,6 +183,26 @@ def snapshot(ctx: click.Context, release: Optional[str],
         log_file=log_file,
     )
 
+    # Проверка блокирующего чекпойнта
+    checkpoint = agent._load_checkpoint()
+    if checkpoint:
+        cp_cmd = checkpoint.get("command", "")
+        if cp_cmd != "snapshot":
+            click.secho(
+                "❌ Невозможно создать snapshot: обнаружен незавершённый процесс "
+                f"'{cp_cmd}'. Завершите его или удалите .docgen-resume.yaml вручную.",
+                fg="red", err=True,
+            )
+            sys.exit(1)
+        if cp_cmd == "snapshot" and release is not None and checkpoint.get("release_tag") != release:
+            click.secho(
+                "❌ Невозможно создать snapshot: обнаружен прерванный snapshot для "
+                f"тега '{checkpoint.get('release_tag')}', а запрошен '{release}'. "
+                "Завершите его или удалите .docgen-resume.yaml вручную.",
+                fg="red", err=True,
+            )
+            sys.exit(1)
+
     try:
         result = agent.snapshot(release_tag=release, check=check, max_turns=iterations)
     except DocAgentError as exc:
@@ -240,6 +260,19 @@ def watch(ctx: click.Context, interval: int,
                          log_file=log_file)
         if iterations is not None:
             agent._max_turns = iterations
+
+        # Проверка блокирующего чекпойнта
+        checkpoint = agent._load_checkpoint()
+        if checkpoint:
+            cp_cmd = checkpoint.get("command", "")
+            if cp_cmd != "watch":
+                click.secho(
+                    "❌ Невозможно запустить watch: обнаружен незавершённый процесс "
+                    f"'{cp_cmd}'. Завершите его или удалите .docgen-resume.yaml вручную.",
+                    fg="red", err=True,
+                )
+                sys.exit(1)
+
         agent.watch(interval=interval)
     except KeyboardInterrupt:
         click.echo("\n  ✋ Остановлено пользователем.")
