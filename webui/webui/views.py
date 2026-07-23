@@ -150,6 +150,32 @@ def watch_create(request: HttpRequest, slug: str) -> HttpResponse:
     ).exists():
         messages.error(request, "Режим наблюдения уже запущен.")
         return redirect(project)
+
+    # Проверка: процесс мог быть FAILED в БД, но реально жив
+    hb_path = project.workspace_path / ".watch_heartbeat"
+    if hb_path.exists():
+        try:
+            mtime = hb_path.stat().st_mtime
+            age = timezone.now().timestamp() - mtime
+            interval_sec = project.watch_interval * 60
+            threshold = max(interval_sec * 3, 600)
+            if age <= threshold:
+                stale = project.jobs.filter(
+                    kind=Job.Kind.WATCH, status=Job.Status.FAILED
+                ).first()
+                if stale:
+                    stale.status = Job.Status.RUNNING
+                    stale.error = ""
+                    stale.finished_at = None
+                    stale.save(update_fields=["status", "error", "finished_at"])
+                messages.warning(
+                    request,
+                    "Предыдущий watch-процесс всё ещё работает. Статус восстановлен."
+                )
+                return redirect(project)
+        except OSError:
+            pass
+
     if not (project.workspace_path / ".docgen.yaml").is_file():
         messages.error(request, "Сначала дождитесь завершения инициализации проекта.")
         return redirect(project)

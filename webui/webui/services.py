@@ -85,25 +85,26 @@ def claim_next_job() -> Job | None:
 
 
 def _check_stale_watch_jobs(project) -> None:
-    """Проверить живость WATCH-процессов, мёртвые перевести в FAILED."""
-    import os
-    import signal
-
+    """Проверить живость WATCH-процессов по heartbeat, мёртвые перевести в FAILED."""
     for job in project.jobs.filter(
         kind=Job.Kind.WATCH, status=Job.Status.RUNNING
     ):
-        pid = job.parameters.get("pid")
-        if pid is None:
+        hb_path = project.workspace_path / ".watch_heartbeat"
+        if not hb_path.exists():
+            # Процесс ещё стартует (grace period)
             continue
         try:
-            os.kill(int(pid), signal.SIG_DFL)
-        except (OSError, ProcessLookupError):
+            mtime = hb_path.stat().st_mtime
+        except OSError:
+            continue
+        age = timezone.now().timestamp() - mtime
+        interval_sec = job.project.watch_interval * 60
+        threshold = max(interval_sec * 3, 600)
+        if age > threshold:
             job.status = Job.Status.FAILED
-            job.error = (job.error or "") + "\nПроцесс наблюдения неожиданно завершился."
+            job.error = "Watch-процесс не отвечает (heartbeat истёк)"
             job.finished_at = timezone.now()
             job.save(update_fields=["status", "error", "finished_at"])
-        except (ValueError, TypeError):
-            pass
 
 
 def execute_job(job: Job) -> None:
@@ -133,10 +134,8 @@ def execute_job(job: Job) -> None:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            job.parameters = {**job.parameters, "pid": proc.pid}
             job.save(update_fields=["parameters", "log_path"])
             return
-
         result = subprocess.run(
             command,
             cwd=workspace,

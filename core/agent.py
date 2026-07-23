@@ -374,10 +374,22 @@ class DocAgent:
             except Exception as exc:
                 self._log(f"  [agent]   ⚠ Ошибка: {exc}")
 
+            self._write_heartbeat()
+
             if self.verbose:
                 now = datetime.now().strftime("%H:%M:%S")
                 self._log(f"\n  [agent] 💤 Сон {interval} мин")
             time.sleep(interval * 60)
+
+    # ── Heartbeat ────────────────────────────────────────
+
+    def _write_heartbeat(self) -> None:
+        """Обновить heartbeat-метку для проверки живучести watch-процесса."""
+        try:
+            hb_path = self._work_dir / ".watch_heartbeat"
+            hb_path.write_text(datetime.now().isoformat())
+        except Exception:
+            pass
 
     # ── Внутренние методы ────────────────────────────────
 
@@ -582,7 +594,11 @@ class DocAgent:
         # ── Шаг 5: обновляем файлы, которые затронул LLM ──
         raw_diffs = get_raw_diffs(self._clone_dir, from_ref, to_ref)
         updated = 0
+        if self.verbose and docs_to_update:
+            self._log(f"  [agent]   ── Обновление файлов ──")
         for rel_path in docs_to_update:
+            if self.verbose:
+                self._log(f"  [agent]   📄 {rel_path}")
             old_content = self._read_doc_file(new_snapshot_dir, rel_path)
             if old_content is None:
                 # Файл не в снэпшоте — может, из репозитория?
@@ -617,13 +633,18 @@ class DocAgent:
                 dest.write_text(new_content, encoding="utf-8")
                 updated += 1
                 if self.verbose:
-                    self._log(f"  [agent]   ↔ {rel_path} (синхронизирован из репозитория)")
+                    self._log(f"  [agent]   ✏️ {rel_path} (обновлён агентом)")
+            else:
+                if self.verbose:
+                    self._log(f"  [agent]   ✓ {rel_path} (актуален, без изменений)")
 
         result.docs_updated = updated
 
         # ── Шаг 6: новые .md из репозитория ──
         added = 0
         if copy_new_from_repo:
+            if self.verbose and new_repo_md:
+                self._log(f"  [agent]   ── Новые файлы из репозитория ──")
             for md_path in sorted(new_repo_md):
                 dest = Path(new_snapshot_dir) / md_path
                 if not dest.exists():
@@ -642,6 +663,8 @@ class DocAgent:
         # ── Шаг 7: удалённые .md (в репозитории файл удалён) ──
         deleted_md = get_deleted_md_files(self._clone_dir, from_ref, to_ref)
         removed = 0
+        if self.verbose and deleted_md:
+            self._log(f"  [agent]   ── Удалённые файлы ──")
         for md_path in deleted_md:
             dest = Path(new_snapshot_dir) / md_path
             if dest.exists():
